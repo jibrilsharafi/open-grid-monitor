@@ -1,0 +1,15 @@
+# Access Control List for Open Grid Monitor
+# Format: topic [read|write|readwrite] <topic>
+
+# Allow grid monitor user to read/write to all open grid monitor topics
+# Note: Replace 'grid_monitor' with your actual MQTT_USERNAME from .env
+user grid_monitor
+topic readwrite open_grid_monitor/+/measurement
+topic readwrite open_grid_monitor/+/status
+topic readwrite open_grid_monitor/+/logs
+
+# Allow device-specific topics (where %c is the client ID)
+pattern readwrite open_grid_monitor/%c/+
+
+# Optional: Allow read-only access for monitoring tools
+# topic read open_grid_monitor/+/+

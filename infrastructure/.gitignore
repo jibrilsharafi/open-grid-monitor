@@ -1,0 +1,15 @@
+# Environment variables with sensitive data
+.env
+
+# Runtime configuration files
+telegraf/telegraf-*-runtime.conf
+
+# Data directories
+mosquitto/data/
+mosquitto/log/
+influxdb/
+grafana/
+
+# Generated password files
+mosquitto/config/passwd
+mosquitto/config/passwd_temp
