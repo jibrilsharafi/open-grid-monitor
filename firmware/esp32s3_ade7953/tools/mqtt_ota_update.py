@@ -398,10 +398,10 @@ def start_http_server(firmware_path, port=8000):
 def find_firmware_file():
     """Try to find the firmware file automatically"""
     possible_paths = [
-        "build/esp32s3_ade7953.bin",
-        "../build/esp32s3_ade7953.bin",
-        "../../build/esp32s3_ade7953.bin",
-        "esp32s3_ade7953.bin"
+        "build/open-grid-monitor.bin",
+        "../build/open-grid-monitor.bin",
+        "../../build/open-grid-monitor.bin",
+        "open-grid-monitor.bin"
     ]
 
     for path in possible_paths:

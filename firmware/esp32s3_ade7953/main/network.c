@@ -14,6 +14,8 @@ static bool g_log_forwarding_initialized = false;
 static vprintf_like_t g_original_log_function = NULL;
 static TaskHandle_t g_rollback_check_task = NULL;
 static bool g_time_synced = false;
+static TaskHandle_t g_deferred_shutdown_task = NULL;
+static bool g_coredump_in_progress = false;
 
 // Forward declarations
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
@@ -23,6 +25,7 @@ static void measurement_publishing_task(void *pvParameters);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static int custom_log_writer(const char *fmt, va_list args);
 static void rollback_check_task(void *pvParameters);
+static void deferred_shutdown_task(void *pvParameters);
 static void add_to_log_buffer(network_handle_t *handle, const char *message, const char *topic);
 static void add_to_log_buffer(network_handle_t *handle, const char *message, const char *topic);
 static void handle_mqtt_command(const char *command);
@@ -77,12 +80,12 @@ static int custom_log_writer(const char *fmt, va_list args)
         }
         
         if (g_network_handle) {
-            snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/logs/%s", 
-                     MQTT_TOPIC_BASE, g_network_handle->mac_address, log_level);
+            snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/%s/%s", 
+                     MQTT_TOPIC_BASE, g_network_handle->mac_address, MQTT_TOPIC_LOGS, log_level);
             topic = topic_buffer;
         } else {
             // Fallback to default topic if handle not available
-            snprintf(topic_buffer, sizeof(topic_buffer), "%s/logs/%s", MQTT_TOPIC_BASE, log_level);
+            snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/%s", MQTT_TOPIC_BASE, MQTT_TOPIC_LOGS, log_level);
             topic = topic_buffer;
         }
 
@@ -256,9 +259,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     if (event && event->topic && event->data) {
         ESP_LOGD(TAG, "MQTT event received: %ld | Topic: %.*s | Data length: %d | Data: %.*s",
                  event_id, event->topic_len, event->topic, event->data_len, event->data_len, event->data);
-    } else {
-        ESP_LOGD(TAG, "MQTT event received: %ld | Topic: %s | Data length: %d",
-                 event_id, event && event->topic ? "valid" : "null", event ? event->data_len : 0);
     }
     
     switch ((esp_mqtt_event_id_t)event_id) {
@@ -274,12 +274,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (g_network_handle) {
                 network_publish_firmware_info(g_network_handle);
             }
-            
-            // Check and publish core dump if available
-            if (g_network_handle) {
-                network_check_and_publish_coredump(g_network_handle);
-            }
-            
+
             // Subscribe to command topic if command handling is enabled
             if (g_network_handle && g_network_handle->mqtt_commands_enabled) {
                 int msg_id = esp_mqtt_client_subscribe(g_mqtt_client, g_network_handle->mqtt_topic_command, 0);
@@ -332,7 +327,7 @@ static void handle_mqtt_command(const char *command)
     ESP_LOGI(TAG, "Processing MQTT command: %s", command);
     
     if (strcmp(command, MQTT_COMMAND_RESTART) == 0) {
-        ESP_LOGW(TAG, "Restart command received via MQTT - initiating graceful restart...");
+        ESP_LOGW(TAG, "Restart command received via MQTT - scheduling graceful restart...");
         
         // Send confirmation back via MQTT if possible
         if (g_mqtt_client && g_network_handle) {
@@ -340,13 +335,49 @@ static void handle_mqtt_command(const char *command)
                                   "Restart command received, performing graceful restart", 0, 0, 0);
         }
         
-        // Perform graceful restart
-        esp_err_t shutdown_err = network_graceful_shutdown_and_restart(g_network_handle, "MQTT restart command");
-        if (shutdown_err != ESP_OK) {
-            ESP_LOGW(TAG, "Graceful restart failed, performing immediate restart");
+        // Schedule deferred restart to avoid MQTT task deadlock
+        esp_err_t defer_err = network_schedule_deferred_restart("MQTT restart command");
+        if (defer_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to schedule deferred restart: %s", esp_err_to_name(defer_err));
+            // Fallback to immediate restart with delay
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         }
+    } else if (strcmp(command, MQTT_COMMAND_COREDUMP) == 0) {
+        ESP_LOGI(TAG, "Core dump request received via MQTT");
+        
+        // Check if core dump operation is already in progress
+        if (g_coredump_in_progress) {
+            ESP_LOGW(TAG, "Core dump operation already in progress, ignoring duplicate request");
+            if (g_mqtt_client && g_network_handle) {
+                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, 
+                                      "Core dump operation already in progress, request ignored", 0, 0, 0);
+            }
+            return;
+        }
+        
+        // Set flag to indicate core dump is in progress
+        g_coredump_in_progress = true;
+        
+        // Send confirmation back via MQTT
+        if (g_mqtt_client && g_network_handle) {
+            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, 
+                                  "Core dump request received, checking for available data", 0, 0, 0);
+        }
+        
+        // Check and publish core dump
+        esp_err_t coredump_err = network_request_and_publish_coredump(g_network_handle);
+        if (coredump_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to process core dump request: %s", esp_err_to_name(coredump_err));
+            if (g_mqtt_client && g_network_handle) {
+                char error_msg[128];
+                snprintf(error_msg, sizeof(error_msg), "Core dump request failed: %s", esp_err_to_name(coredump_err));
+                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
+            }
+        }
+        
+        // Clear flag when done
+        g_coredump_in_progress = false;
     } else if (strncmp(command, "{", 1) == 0) {
         // Try to parse as JSON command (for OTA)
         cJSON *json = cJSON_Parse(command);
@@ -450,6 +481,9 @@ static void mqtt_logging_task(void *pvParameters) {
     }
     
     ESP_LOGI(TAG, "MQTT logging task stopped");
+    
+    // Clear the global task handle before exiting
+    g_mqtt_log_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -549,6 +583,9 @@ static void measurement_publishing_task(void *pvParameters) {
     }
     
     ESP_LOGI(TAG, "Measurement publishing task stopped");
+    
+    // Clear the global task handle before exiting
+    g_measurement_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -599,17 +636,16 @@ esp_err_t network_init(network_handle_t *handle) {
     // Set MQTT client ID using MAC address
     snprintf(handle->mqtt_client_id, sizeof(handle->mqtt_client_id), "grid_monitor_%s", handle->mac_address);
     
-    // Initialize MQTT topics with MAC address as second element
-    snprintf(handle->mqtt_topic_logs, sizeof(handle->mqtt_topic_logs), "%s/%s/logs", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_status, sizeof(handle->mqtt_topic_status), "%s/%s/status", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_measurement, sizeof(handle->mqtt_topic_measurement), "%s/%s/measurement", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_system, sizeof(handle->mqtt_topic_system), "%s/%s/system", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_error, sizeof(handle->mqtt_topic_error), "%s/%s/error", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_debug, sizeof(handle->mqtt_topic_debug), "%s/%s/debug", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_command, sizeof(handle->mqtt_topic_command), "%s/%s/command", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_coredump, sizeof(handle->mqtt_topic_coredump), "%s/%s/coredump", MQTT_TOPIC_BASE, handle->mac_address);
-    snprintf(handle->mqtt_topic_firmware, sizeof(handle->mqtt_topic_firmware), "%s/%s/firmware", MQTT_TOPIC_BASE, handle->mac_address);
-    
+    // Initialize MQTT topics with MAC address as second element using defined topic suffixes
+    snprintf(handle->mqtt_topic_logs, sizeof(handle->mqtt_topic_logs), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_LOGS);
+    snprintf(handle->mqtt_topic_status, sizeof(handle->mqtt_topic_status), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_STATUS);
+    snprintf(handle->mqtt_topic_measurement, sizeof(handle->mqtt_topic_measurement), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_MEASUREMENT);
+    snprintf(handle->mqtt_topic_system, sizeof(handle->mqtt_topic_system), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_SYSTEM);
+    snprintf(handle->mqtt_topic_error, sizeof(handle->mqtt_topic_error), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_ERROR);
+    snprintf(handle->mqtt_topic_debug, sizeof(handle->mqtt_topic_debug), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_DEBUG);
+    snprintf(handle->mqtt_topic_command, sizeof(handle->mqtt_topic_command), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_COMMAND);
+    snprintf(handle->mqtt_topic_coredump, sizeof(handle->mqtt_topic_coredump), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_COREDUMP);
+    snprintf(handle->mqtt_topic_firmware, sizeof(handle->mqtt_topic_firmware), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_FIRMWARE);
     ESP_LOGI(TAG, "MAC address: %s", handle->mac_address);
     ESP_LOGI(TAG, "MQTT client ID: %s", handle->mqtt_client_id);
     
@@ -656,10 +692,20 @@ esp_err_t network_deinit(network_handle_t *handle) {
     network_stop_ota(handle);
     network_stop_wifi(handle);
     
-    // Clean up rollback check task
+    // Clean up rollback check task (if still running)
     if (g_rollback_check_task) {
-        vTaskDelete(g_rollback_check_task);
+        ESP_LOGD(TAG, "Cleaning up rollback check task in deinit");
+        TaskHandle_t task_to_delete = g_rollback_check_task;
         g_rollback_check_task = NULL;
+        vTaskDelete(task_to_delete);
+    }
+    
+    // Clean up deferred shutdown task (if still running)
+    if (g_deferred_shutdown_task) {
+        ESP_LOGD(TAG, "Cleaning up deferred shutdown task in deinit");
+        TaskHandle_t task_to_delete = g_deferred_shutdown_task;
+        g_deferred_shutdown_task = NULL;
+        vTaskDelete(task_to_delete);
     }
     
     if (handle->wifi_event_group) {
@@ -889,18 +935,35 @@ esp_err_t network_stop_mqtt_logging(network_handle_t *handle) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    handle->mqtt_logging_enabled = false;
+    if (!g_mqtt_log_task) {
+        ESP_LOGD(TAG, "MQTT logging task not running");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Stopping MQTT logging...");
     
     // Stop log forwarding first
     network_stop_log_forwarding(handle);
     
-    // Give the logging task time to process remaining messages
-    if (g_mqtt_log_task) {
-        ESP_LOGI(TAG, "Waiting for MQTT logging task to finish...");
-        vTaskDelay(pdMS_TO_TICKS(500)); // Give time for queue to drain
+    // Signal the logging task to stop
+    handle->mqtt_logging_enabled = false;
+    
+    // Wait for the logging task to exit on its own (with timeout)
+    int timeout_ms = 2000; // 2 seconds timeout
+    int check_interval_ms = 50; // Check every 50ms
+    int checks = timeout_ms / check_interval_ms;
+    
+    for (int i = 0; i < checks && g_mqtt_log_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(check_interval_ms));
+    }
+    
+    if (g_mqtt_log_task != NULL) {
+        ESP_LOGW(TAG, "MQTT logging task did not exit gracefully, forcing deletion");
         TaskHandle_t task_to_delete = g_mqtt_log_task;
-        g_mqtt_log_task = NULL;  // Clear the global first
+        g_mqtt_log_task = NULL;
         vTaskDelete(task_to_delete);
+    } else {
+        ESP_LOGI(TAG, "MQTT logging task stopped gracefully");
     }
     
     // Stop MQTT client gracefully
@@ -1029,6 +1092,9 @@ static void rollback_check_task(void *pvParameters) {
         ESP_LOGI(TAG, "Firmware marked as valid successfully");
     }
     
+    // Clear the global task handle before exiting
+    g_rollback_check_task = NULL;
+    
     // This should never be reached
     vTaskDelete(NULL);
 }
@@ -1122,6 +1188,79 @@ void network_schedule_rollback_check(void) {
     }
 }
 
+// Deferred shutdown task - performs shutdown/restart outside of MQTT task context
+static void deferred_shutdown_task(void *pvParameters) {
+    const char *reason = (const char *)pvParameters;
+    
+    ESP_LOGI(TAG, "Deferred shutdown task started. Reason: %s", reason ? reason : "Unknown");
+    
+    // Small delay to allow MQTT message to be sent
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    ESP_LOGI(TAG, "Initiating graceful restart. Reason: %s", reason ? reason : "Unknown");
+    
+    // Perform graceful shutdown (but don't call the full graceful_shutdown_and_restart to avoid task cleanup)
+    esp_err_t err = network_graceful_shutdown(g_network_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Graceful shutdown failed: %s", esp_err_to_name(err));
+    }
+    
+    // Free the reason string if it was allocated
+    if (reason) {
+        free((void*)reason);
+    }
+    
+    // Clear the global task handle
+    g_deferred_shutdown_task = NULL;
+    
+    // Final delay before restart to ensure all operations complete
+    ESP_LOGI(TAG, "Restarting system in 2 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Restart the system
+    esp_restart();
+    
+    // This should never be reached
+    vTaskDelete(NULL);
+}
+
+// Schedule a deferred restart to avoid MQTT task deadlock
+esp_err_t network_schedule_deferred_restart(const char *reason) {
+    if (g_deferred_shutdown_task) {
+        ESP_LOGW(TAG, "Deferred shutdown task already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    // Create a copy of the reason string that will persist for the task
+    char *reason_copy = NULL;
+    if (reason) {
+        reason_copy = malloc(strlen(reason) + 1);
+        if (reason_copy) {
+            strcpy(reason_copy, reason);
+        }
+    }
+    
+    BaseType_t ret = xTaskCreate(
+        deferred_shutdown_task,
+        DEFERRED_SHUTDOWN_TASK_NAME,
+        DEFERRED_SHUTDOWN_TASK_STACK_SIZE,
+        reason_copy,
+        DEFERRED_SHUTDOWN_TASK_PRIORITY,
+        &g_deferred_shutdown_task
+    );
+    
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create deferred shutdown task");
+        if (reason_copy) {
+            free(reason_copy);
+        }
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Deferred restart scheduled: %s", reason ? reason : "Unknown");
+    return ESP_OK;
+}
+
 // MQTT OTA implementation with progress updates
 static esp_err_t perform_mqtt_ota(const char *url)
 {
@@ -1196,23 +1335,43 @@ static esp_err_t perform_mqtt_ota(const char *url)
 
     int binary_file_length = 0;
     int last_progress_report = 0;
+    int chunk_count = 0;
+    
+    ESP_LOGI(TAG, "Starting OTA download from: %s", url);
+    if (g_mqtt_client && g_network_handle) {
+        char start_msg[256];
+        snprintf(start_msg, sizeof(start_msg), "Starting OTA download: %d bytes from %s", content_length, url);
+        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, start_msg, 0, 0, 0);
+    }
     
     while (true) {
         int data_read = esp_http_client_read(client, upgrade_data_buf, 1024);
         if (data_read < 0) {
-            ESP_LOGE(TAG, "Data read error");
+            ESP_LOGE(TAG, "OTA data read error after %d bytes", binary_file_length);
+            if (g_mqtt_client && g_network_handle) {
+                char error_msg[128];
+                snprintf(error_msg, sizeof(error_msg), "OTA download failed after %d bytes", binary_file_length);
+                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
+            }
             break;
         } else if (data_read > 0) {
             err = esp_ota_write(ota_handle, (const void *)upgrade_data_buf, data_read);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                ESP_LOGE(TAG, "esp_ota_write failed after %d bytes: %s", binary_file_length, esp_err_to_name(err));
+                if (g_mqtt_client && g_network_handle) {
+                    char error_msg[128];
+                    snprintf(error_msg, sizeof(error_msg), "OTA write failed after %d bytes: %s", 
+                            binary_file_length, esp_err_to_name(err));
+                    esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
+                }
                 break;
             }
             binary_file_length += data_read;
+            chunk_count++;
             
-            // Send progress updates via MQTT every 10%
+            // Send progress updates via MQTT every 5%
             int progress = (binary_file_length * 100) / content_length;
-            if (progress >= last_progress_report + 10) {
+            if (progress >= last_progress_report + 5) {
                 last_progress_report = progress;
                 if (g_mqtt_client && g_network_handle) {
                     char progress_msg[128];
@@ -1220,10 +1379,25 @@ static esp_err_t perform_mqtt_ota(const char *url)
                             progress, binary_file_length, content_length);
                     esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, progress_msg, 0, 0, 0);
                 }
-                ESP_LOGI(TAG, "OTA Progress: %d%%", progress);
+                ESP_LOGI(TAG, "OTA Progress: %d%% (%d chunks received)", progress, chunk_count);
+                
+                // Small delay to allow other tasks to run and MQTT messages to be sent
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            
+            // Yield every 32KB to allow other tasks (especially MQTT logging) to run
+            if ((binary_file_length % (32 * 1024)) == 0) {
+                ESP_LOGD(TAG, "OTA: Downloaded %d KB, yielding to other tasks...", binary_file_length / 1024);
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
         } else if (data_read == 0) {
-            ESP_LOGI(TAG, "Connection closed, all data received");
+            ESP_LOGI(TAG, "OTA download completed - received %d bytes in %d chunks", binary_file_length, chunk_count);
+            if (g_mqtt_client && g_network_handle) {
+                char complete_msg[128];
+                snprintf(complete_msg, sizeof(complete_msg), "OTA download completed: %d bytes in %d chunks", 
+                        binary_file_length, chunk_count);
+                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, complete_msg, 0, 0, 0);
+            }
             break;
         }
     }
@@ -1265,13 +1439,20 @@ static esp_err_t perform_mqtt_ota(const char *url)
 
     ESP_LOGI(TAG, "OTA update successful, initiating graceful restart...");
     if (g_mqtt_client && g_network_handle) {
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, "OTA update completed successfully, restarting gracefully...", 0, 0, 0);
+        char final_msg[256];
+        snprintf(final_msg, sizeof(final_msg), 
+                "OTA update completed successfully! Downloaded %d bytes, flashed to %s partition, restarting gracefully...", 
+                binary_file_length, ota_partition->label);
+        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, final_msg, 0, 0, 0);
+        
+        // Give time for the final message to be sent
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
     
-    // Graceful shutdown and restart instead of immediate restart
-    esp_err_t shutdown_err = network_graceful_shutdown_and_restart(g_network_handle, "OTA update completed");
-    if (shutdown_err != ESP_OK) {
-        ESP_LOGW(TAG, "Graceful shutdown failed, performing immediate restart");
+    // Schedule deferred restart to avoid MQTT task deadlock
+    esp_err_t defer_err = network_schedule_deferred_restart("OTA update completed");
+    if (defer_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to schedule deferred restart, performing immediate restart");
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }
@@ -1326,29 +1507,7 @@ esp_err_t network_graceful_shutdown(network_handle_t *handle) {
 
     // Stop MQTT logging with proper cleanup
     if (handle->mqtt_logging_enabled) {
-        ESP_LOGI(TAG, "Stopping MQTT logging...");
-        handle->mqtt_logging_enabled = false;
-        
-        // Wait for logging task to stop
-        if (g_mqtt_log_task) {
-            vTaskDelay(pdMS_TO_TICKS(100)); // Give task time to exit gracefully
-        }
-        
-        // Stop MQTT client gracefully
-        if (g_mqtt_client) {
-            ESP_LOGI(TAG, "Disconnecting MQTT client...");
-            esp_mqtt_client_stop(g_mqtt_client);
-            vTaskDelay(pdMS_TO_TICKS(300)); // Wait for graceful disconnect
-            esp_mqtt_client_destroy(g_mqtt_client);
-            g_mqtt_client = NULL;
-        }
-        
-        // Clean up logging task
-        if (g_mqtt_log_task) {
-            TaskHandle_t task_to_delete = g_mqtt_log_task;
-            g_mqtt_log_task = NULL;  // Clear the global first
-            vTaskDelete(task_to_delete);
-        }
+        network_stop_mqtt_logging(handle);
     }
 
     // Check timeout
@@ -1372,11 +1531,16 @@ esp_err_t network_graceful_shutdown(network_handle_t *handle) {
         handle->status = WIFI_STATUS_DISCONNECTED;
     }
 
-    // Clean up rollback check task
+    // Clean up rollback check task (if still running)
     if (g_rollback_check_task) {
-        vTaskDelete(g_rollback_check_task);
+        ESP_LOGD(TAG, "Cleaning up rollback check task");
+        TaskHandle_t task_to_delete = g_rollback_check_task;
         g_rollback_check_task = NULL;
+        vTaskDelete(task_to_delete);
     }
+
+    // Note: Do NOT clean up deferred shutdown task here as it might be calling this function
+    // The deferred shutdown task will clean itself up after restart
 
     ESP_LOGI(TAG, "Graceful network shutdown completed in %lu ms", 
              (xTaskGetTickCount() - shutdown_start) * portTICK_PERIOD_MS);
@@ -1438,19 +1602,32 @@ esp_err_t network_stop_measurement_publishing(network_handle_t *handle) {
         return ESP_ERR_INVALID_ARG;
     }
     
+    if (!g_measurement_task) {
+        ESP_LOGD(TAG, "Measurement publishing task not running");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Stopping measurement publishing...");
+    
+    // Signal the task to stop
     handle->measurement_publishing_enabled = false;
     
-    if (g_measurement_task) {
-        ESP_LOGI(TAG, "Stopping measurement publishing task...");
-        // Give time for task to exit gracefully
-        vTaskDelay(pdMS_TO_TICKS(200)); 
-        
-        // Check if task is still running before attempting to delete
-        if (g_measurement_task) {
-            TaskHandle_t task_to_delete = g_measurement_task;
-            g_measurement_task = NULL;  // Clear the global first
-            vTaskDelete(task_to_delete);
-        }
+    // Wait for the task to exit on its own (with timeout)
+    int timeout_ms = 1000; // 1 second timeout
+    int check_interval_ms = 50; // Check every 50ms
+    int checks = timeout_ms / check_interval_ms;
+    
+    for (int i = 0; i < checks && g_measurement_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(check_interval_ms));
+    }
+    
+    if (g_measurement_task != NULL) {
+        ESP_LOGW(TAG, "Measurement task did not exit gracefully, forcing deletion");
+        TaskHandle_t task_to_delete = g_measurement_task;
+        g_measurement_task = NULL;
+        vTaskDelete(task_to_delete);
+    } else {
+        ESP_LOGI(TAG, "Measurement publishing task stopped gracefully");
     }
     
     ESP_LOGI(TAG, "Measurement publishing stopped");
@@ -1601,6 +1778,12 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
         return ESP_ERR_INVALID_ARG;
     }
     
+    // Check if core dump operation is already in progress
+    if (g_coredump_in_progress) {
+        ESP_LOGD(TAG, "Core dump operation already in progress, skipping automatic check");
+        return ESP_OK;
+    }
+    
     // Check if core dump partition exists
     const esp_partition_t *core_dump_partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
@@ -1636,6 +1819,9 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
     }
     
     ESP_LOGW(TAG, "Core dump data detected! Publishing to MQTT...");
+    
+    // Set flag to indicate core dump is in progress
+    g_coredump_in_progress = true;
     
     // Send header info first
     cJSON *header_json = cJSON_CreateObject();
@@ -1674,8 +1860,8 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
     cJSON_AddStringToObject(header_json, "compile_time", app_desc->time);
     
     char header_topic[128];
-    snprintf(header_topic, sizeof(header_topic), "%s/header", handle->mqtt_topic_coredump);
-    
+    snprintf(header_topic, sizeof(header_topic), "%s/%s", handle->mqtt_topic_coredump, MQTT_TOPIC_HEADER);
+
     char *header_string = cJSON_Print(header_json);
     if (header_string) {
         esp_mqtt_client_publish(g_mqtt_client, header_topic, header_string, 0, 1, 0);
@@ -1689,6 +1875,7 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
     uint8_t *chunk_buffer = malloc(chunk_size);
     if (!chunk_buffer) {
         ESP_LOGE(TAG, "Failed to allocate chunk buffer for core dump");
+        g_coredump_in_progress = false;
         return ESP_ERR_NO_MEM;
     }
     
@@ -1732,7 +1919,7 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
                 char *chunk_string = cJSON_Print(chunk_json);
                 if (chunk_string) {
                     char topic[128];
-                    snprintf(topic, sizeof(topic), "%s/chunk/%zu", handle->mqtt_topic_coredump, chunk);
+                    snprintf(topic, sizeof(topic), "%s/%s/%zu", handle->mqtt_topic_coredump, MQTT_TOPIC_CHUNK, chunk);
                     esp_mqtt_client_publish(g_mqtt_client, topic, chunk_string, 0, 1, 0);
                     free(chunk_string);
                 }
@@ -1746,14 +1933,15 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
         
         // Progress logging
         if (chunk % 10 == 0 || chunk == total_chunks - 1) {
-            ESP_LOGI(TAG, "Core dump progress: %zu/%zu chunks sent (%.1f%%)", 
+            ESP_LOGD(TAG, "Core dump progress: %zu/%zu chunks sent (%.1f%%)", 
                      chunk + 1, total_chunks, ((float)(chunk + 1) / total_chunks) * 100.0);
         }
         
         // Small delay to avoid overwhelming the MQTT broker
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     
+    // Free the chunk buffer
     free(chunk_buffer);
     
     // Send completion message
@@ -1764,8 +1952,8 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
         cJSON_AddNumberToObject(completion_json, "total_size", core_dump_partition->size);
         
         char complete_topic[128];
-        snprintf(complete_topic, sizeof(complete_topic), "%s/complete", handle->mqtt_topic_coredump);
-        
+        snprintf(complete_topic, sizeof(complete_topic), "%s/%s", handle->mqtt_topic_coredump, MQTT_TOPIC_COMPLETE);
+
         char *completion_string = cJSON_Print(completion_json);
         if (completion_string) {
             esp_mqtt_client_publish(g_mqtt_client, complete_topic, completion_string, 0, 1, 0);
@@ -1776,10 +1964,76 @@ esp_err_t network_check_and_publish_coredump(network_handle_t *handle) {
     
     ESP_LOGW(TAG, "Core dump data published to MQTT successfully");
     
-    // Optionally clear the core dump after reporting
-    esp_core_dump_image_erase();
+    // Clear core dump in progress flag
+    g_coredump_in_progress = false;
     
+    // Clear dump partition
+    ESP_LOGI(TAG, "Clearing core dump partition after successful transmission...");
+    esp_partition_erase_range(core_dump_partition, 0, core_dump_partition->size);
+
     return ESP_OK;
+}
+
+// Request and publish core dump via MQTT command
+esp_err_t network_request_and_publish_coredump(network_handle_t *handle) {
+    if (!handle || !g_mqtt_client) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Processing core dump request via MQTT...");
+    
+    // Check if core dump partition exists
+    const esp_partition_t *core_dump_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+    
+    if (!core_dump_partition) {
+        ESP_LOGW(TAG, "No core dump partition configured on this device");
+        if (g_mqtt_client && handle) {
+            esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_status, 
+                                  "No core dump partition available on this device", 0, 0, 0);
+        }
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    // Read the first few bytes to check if there's data
+    uint8_t header[16];
+    esp_err_t err = esp_partition_read(core_dump_partition, 0, header, sizeof(header));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read core dump partition: %s", esp_err_to_name(err));
+        if (g_mqtt_client && handle) {
+            char error_msg[128];
+            snprintf(error_msg, sizeof(error_msg), "Failed to read core dump partition: %s", esp_err_to_name(err));
+            esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_error, error_msg, 0, 0, 0);
+        }
+        return err;
+    }
+    
+    // Check if partition contains data (not all 0xFF)
+    bool has_data = false;
+    for (int i = 0; i < sizeof(header); i++) {
+        if (header[i] != 0xFF) {
+            has_data = true;
+            break;
+        }
+    }
+    
+    if (!has_data) {
+        ESP_LOGI(TAG, "No core dump data available - partition is empty");
+        if (g_mqtt_client && handle) {
+            esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_status, 
+                                  "No core dump data available - device has not crashed recently", 0, 0, 0);
+        }
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Core dump data found! Publishing to MQTT as requested...");
+    if (g_mqtt_client && handle) {
+        esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_status, 
+                              "Core dump data found - starting transmission", 0, 0, 0);
+    }
+    
+    // Use the existing core dump publishing function
+    return network_check_and_publish_coredump(handle);
 }
 
 // Publish firmware version and OTA status

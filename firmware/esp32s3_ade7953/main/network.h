@@ -50,7 +50,8 @@
 #define GRACEFUL_SHUTDOWN_TIMEOUT_MS  10000  // Maximum time to wait for graceful shutdown
 
 // MQTT logging configuration
-#define MQTT_BROKER_URI         "mqtt://192.168.2.41"
+// #define MQTT_BROKER_URI         "mqtt://192.168.2.41"
+#define MQTT_BROKER_URI         "mqtt://192.168.2.78"
 #define MQTT_PORT               1883
 // MQTT Authentication - set to default values to disable, or change to your credentials
 #define MQTT_KEEPALIVE          60
@@ -61,19 +62,23 @@
 
 // MQTT Topics
 #define MQTT_TOPIC_BASE         "open_grid_monitor"
-#define MQTT_TOPIC_LOGS         MQTT_TOPIC_BASE "/logs"
-#define MQTT_TOPIC_STATUS       MQTT_TOPIC_BASE "/status" 
-#define MQTT_TOPIC_MEASUREMENT  MQTT_TOPIC_BASE "/measurement"
-#define MQTT_TOPIC_SYSTEM       MQTT_TOPIC_BASE "/system"
-#define MQTT_TOPIC_ERROR        MQTT_TOPIC_BASE "/error"
-#define MQTT_TOPIC_DEBUG        MQTT_TOPIC_BASE "/debug"
-#define MQTT_TOPIC_COMMAND      MQTT_TOPIC_BASE "/command"
-#define MQTT_TOPIC_COREDUMP     MQTT_TOPIC_BASE "/coredump"
-#define MQTT_TOPIC_FIRMWARE     MQTT_TOPIC_BASE "/firmware"
+#define MQTT_TOPIC_LOGS         "logs"
+#define MQTT_TOPIC_STATUS       "status" 
+#define MQTT_TOPIC_MEASUREMENT  "measurement"
+#define MQTT_TOPIC_SYSTEM       "system"
+#define MQTT_TOPIC_ERROR        "error"
+#define MQTT_TOPIC_DEBUG        "debug"
+#define MQTT_TOPIC_COMMAND      "command"
+#define MQTT_TOPIC_COREDUMP     "coredump"
+#define MQTT_TOPIC_HEADER       "header"
+#define MQTT_TOPIC_CHUNK        "chunk"
+#define MQTT_TOPIC_COMPLETE     "complete"
+#define MQTT_TOPIC_FIRMWARE     "firmware"
 
 // MQTT Commands
 #define MQTT_COMMAND_RESTART    "restart"
 #define MQTT_COMMAND_OTA        "ota"
+#define MQTT_COMMAND_COREDUMP   "coredump"
 
 // MQTT OTA command format: {"url": "http://ip:port/firmware.bin"}
 #define MQTT_OTA_URL_MAX_LEN    256
@@ -86,6 +91,11 @@
 #define ROLLBACK_TASK_NAME       "rollback_task"
 #define ROLLBACK_TASK_STACK_SIZE (4 * 1024)
 #define ROLLBACK_TASK_PRIORITY   3
+
+// Deferred shutdown task configuration
+#define DEFERRED_SHUTDOWN_TASK_NAME       "deferred_shutdown_task"
+#define DEFERRED_SHUTDOWN_TASK_STACK_SIZE (4 * 1024)
+#define DEFERRED_SHUTDOWN_TASK_PRIORITY   2
 
 // Measurement queue configuration
 #define MEASUREMENT_QUEUE_SIZE  100
@@ -190,9 +200,12 @@ void network_schedule_rollback_check(void);
 // Graceful shutdown and restart functions
 esp_err_t network_graceful_shutdown_and_restart(network_handle_t *handle, const char *reason);
 esp_err_t network_graceful_shutdown(network_handle_t *handle);
+esp_err_t network_schedule_deferred_restart(const char *reason);
+esp_err_t network_schedule_deferred_shutdown(const char *reason);
 
 // Core dump and firmware functions
 esp_err_t network_check_and_publish_coredump(network_handle_t *handle);
+esp_err_t network_request_and_publish_coredump(network_handle_t *handle);
 esp_err_t network_publish_firmware_info(network_handle_t *handle);
 
 // Log buffering functions for pre-MQTT logs

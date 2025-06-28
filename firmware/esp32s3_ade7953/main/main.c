@@ -16,6 +16,7 @@ static const char *TAG = "main";
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("network", ESP_LOG_DEBUG);
     esp_log_level_set("main", ESP_LOG_DEBUG);
 

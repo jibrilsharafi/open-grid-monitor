@@ -71,10 +71,10 @@ def upload_firmware(ip_address, firmware_path, port=8080):
 def find_firmware_file():
     """Try to find the firmware file automatically"""
     possible_paths = [
-        "build/esp32s3_ade7953.bin",
-        "../build/esp32s3_ade7953.bin",
-        "../../build/esp32s3_ade7953.bin",
-        "esp32s3_ade7953.bin"
+        "build/open-grid-monitor.bin",
+        "../build/open-grid-monitor.bin",
+        "../../build/open-grid-monitor.bin",
+        "open-grid-monitor.bin"
     ]
 
     for path in possible_paths:
@@ -92,7 +92,7 @@ def main():
         print("Usage: python3 ota_update.py <ESP32_IP_ADDRESS> [firmware_file]")
         print(f"\n{YELLOW}Example:{RESET}")
         print("  python3 ota_update.py 192.168.1.100")
-        print("  python3 ota_update.py 192.168.1.100 build/esp32s3_ade7953.bin")
+        print("  python3 ota_update.py 192.168.1.100 build/open-grid-monitor.bin")
         sys.exit(1)
 
     ip_address = sys.argv[1]
