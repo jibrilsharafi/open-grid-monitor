@@ -119,6 +119,7 @@ mkdir -p grafana
 mkdir -p grafana/provisioning/datasources
 mkdir -p grafana/provisioning/dashboards
 mkdir -p grafana/dashboards
+mkdir -p telegraf
 
 # Generate MQTT password file
 echo "🔐 Creating MQTT user credentials..."
@@ -141,6 +142,20 @@ if [ ! -f mosquitto/config/passwd ] || ! echo "${MQTT_USERNAME}:${MQTT_PASSWORD}
     echo "✅ MQTT credentials updated"
 else
     echo "✅ MQTT credentials already up to date"
+fi
+
+# Pre-create Telegraf configuration file to avoid Docker mount issues
+echo "⚙️  Pre-creating Telegraf configuration..."
+
+# Ensure telegraf runtime config is not a directory (cleanup any previous errors)
+if [ -d telegraf/telegraf-open-grid-monitor-runtime.conf ]; then
+    rm -rf telegraf/telegraf-open-grid-monitor-runtime.conf
+fi
+
+# Create a placeholder configuration file (will be updated later with actual credentials)
+if [ ! -f telegraf/telegraf-open-grid-monitor-runtime.conf ]; then
+    cp telegraf/telegraf-open-grid-monitor.conf telegraf/telegraf-open-grid-monitor-runtime.conf
+    echo "✅ Telegraf placeholder configuration created"
 fi
 
 echo "🐳 Starting Docker services..."
@@ -245,25 +260,26 @@ if [ "$TOKEN_VALID" != "true" ]; then
 fi
 
 # Create Telegraf configuration with actual credentials
-echo "⚙️  Configuring Telegraf with credentials..."
+echo "⚙️  Updating Telegraf configuration with credentials..."
 
-# Only regenerate if runtime config doesn't exist or template has changed
-if [ ! -f telegraf/telegraf-open-grid-monitor-runtime.conf ] || [ telegraf/telegraf-open-grid-monitor.conf -nt telegraf/telegraf-open-grid-monitor-runtime.conf ]; then
-    sed -e "s/MQTT_USERNAME_PLACEHOLDER/${MQTT_USERNAME}/g" \
-        -e "s/MQTT_PASSWORD_PLACEHOLDER/${MQTT_PASSWORD}/g" \
-        -e "s/INFLUXDB_TOKEN_PLACEHOLDER/${INFLUXDB_TOKEN}/g" \
-        -e "s/INFLUXDB_ORG_PLACEHOLDER/${INFLUXDB_ORG}/g" \
-        -e "s/INFLUXDB_BUCKET_PLACEHOLDER/${INFLUXDB_BUCKET}/g" \
-        telegraf/telegraf-open-grid-monitor.conf > telegraf/telegraf-open-grid-monitor-runtime.conf
-    
-    echo "✅ Telegraf configuration updated"
-    
-    # Restart Telegraf to pick up new configuration
-    echo "🔄 Restarting Telegraf with new configuration..."
-    docker-compose restart telegraf-open-grid-monitor
-else
-    echo "✅ Telegraf configuration already up to date"
+# Ensure telegraf runtime config is not a directory (cleanup any previous errors)
+if [ -d telegraf/telegraf-open-grid-monitor-runtime.conf ]; then
+    rm -rf telegraf/telegraf-open-grid-monitor-runtime.conf
 fi
+
+# Update configuration with actual credentials
+sed -e "s/MQTT_USERNAME_PLACEHOLDER/${MQTT_USERNAME}/g" \
+    -e "s/MQTT_PASSWORD_PLACEHOLDER/${MQTT_PASSWORD}/g" \
+    -e "s/INFLUXDB_TOKEN_PLACEHOLDER/${INFLUXDB_TOKEN}/g" \
+    -e "s/INFLUXDB_ORG_PLACEHOLDER/${INFLUXDB_ORG}/g" \
+    -e "s/INFLUXDB_BUCKET_PLACEHOLDER/${INFLUXDB_BUCKET}/g" \
+    telegraf/telegraf-open-grid-monitor.conf > telegraf/telegraf-open-grid-monitor-runtime.conf
+
+echo "✅ Telegraf configuration updated with credentials"
+
+# Restart Telegraf to pick up new configuration
+echo "🔄 Restarting Telegraf with new configuration..."
+docker-compose restart telegraf-open-grid-monitor
 
 # Create Grafana datasource configuration with actual credentials
 echo "📊 Configuring Grafana datasource with credentials..."

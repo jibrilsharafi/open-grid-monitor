@@ -13,3 +13,6 @@ grafana/
 # Generated password files
 mosquitto/config/passwd
 mosquitto/config/passwd_temp
+
+# I don't know, it spawned
+cookies.txt
