@@ -93,7 +93,7 @@ ESP32S3 devices should publish to different topics based on data type:
 
 ## InfluxDB Structure
 
-**Bucket**: `open-grid-monitor`
+**Bucket**: `open_grid_monitor`
 - **Measurement**: `grid_data` (frequency, voltage, current, power)
 - **Measurement**: `device_status` (online, battery, rssi, heap)
 - **Measurement**: `device_logs` (level, message, module)
