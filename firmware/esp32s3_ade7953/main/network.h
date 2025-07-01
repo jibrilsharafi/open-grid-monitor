@@ -32,6 +32,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "led.h"
 #include "secrets.h"
 #include "struct.h"
 
@@ -161,6 +162,7 @@ typedef struct {
     QueueHandle_t log_queue;
     QueueHandle_t measurement_queue;
     log_buffer_t *log_buffer;
+    led_handle_t *led_handle;
 } network_handle_t;
 
 typedef enum {
@@ -182,6 +184,7 @@ esp_err_t network_stop_mqtt_logging(network_handle_t *handle);
 wifi_status_t network_get_wifi_status(network_handle_t *handle);
 const char* network_get_ip_address(network_handle_t *handle);
 bool network_is_connected(network_handle_t *handle);
+bool network_is_mqtt_connected(void);
 
 // MQTT logging functions
 esp_err_t network_setup_log_forwarding(network_handle_t *handle);

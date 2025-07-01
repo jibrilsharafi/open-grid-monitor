@@ -101,6 +101,7 @@ class MQTTOTAUpdater:
         self.ota_start_time = None
         self.ota_progress_data = []
         self.firmware_size = 0
+        self.ota_command_id = 1  # Unique ID for OTA commands
         
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -108,11 +109,12 @@ class MQTTOTAUpdater:
             print(f"{GREEN}✅ Connected to MQTT broker{RESET}")
             # Subscribe to device discovery topics
             client.subscribe(f"{BASE_TOPIC}/+/measurement")
-            # Subscribe to status topics (will be updated with device ID later)
+            # Subscribe to OTA response topics (will be updated with device ID later)
             if self.selected_device:
                 client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/status")
-                client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/error")
-                client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/logs")
+                client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/responses/ota")
+                client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/responses/restart")
+                client.subscribe(f"{BASE_TOPIC}/{self.selected_device}/logs/+")  # Subscribe to all log levels
         else:
             print(f"{RED}❌ Failed to connect to MQTT broker: {rc}{RESET}")
             
@@ -136,50 +138,102 @@ class MQTTOTAUpdater:
         elif self.selected_device and topic == f"{BASE_TOPIC}/{self.selected_device}/status":
             print(f"{CYAN}[{timestamp}] 📋 Status: {payload}{RESET}")
             
-            # Track OTA progress for speed calculation
-            if "OTA Progress:" in payload and self.ota_start_time:
-                try:
-                    # Extract percentage from payload like "OTA Progress: 45% (bytes/total bytes)"
-                    if "%" in payload:
-                        percent_part = payload.split("OTA Progress:")[1].strip()
-                        percent_str = percent_part.split("%")[0].strip()
-                        percentage = float(percent_str)
-                        elapsed_time = time.time() - self.ota_start_time
-                        
-                        # Calculate downloaded bytes and speed
-                        downloaded_bytes = (percentage / 100.0) * self.firmware_size
-                        speed_bps = downloaded_bytes / elapsed_time if elapsed_time > 0 else 0
-                        speed_kbps = speed_bps / 1024
-                        
-                        # Store progress data
-                        self.ota_progress_data.append((time.time(), percentage, downloaded_bytes, speed_bps))
-                        
-                        # Display progress with speed
-                        if speed_kbps > 1024:
-                            speed_str = f"{speed_kbps/1024:.1f} MB/s"
+        # Handle OTA response messages
+        elif self.selected_device and topic == f"{BASE_TOPIC}/{self.selected_device}/responses/ota":
+            try:
+                response_data = json.loads(payload)
+                if "status" in response_data:
+                    status = response_data["status"]
+                    message = response_data.get("message", "")
+                    command_id = response_data.get("id", "unknown")
+                    
+                    if status == "connecting":
+                        print(f"{BLUE}[{timestamp}] 🔗 Connecting to firmware URL...{RESET}")
+                    elif status == "downloading":
+                        content_length = response_data.get("content_length", 0)
+                        if content_length > 0:
+                            print(f"{BLUE}[{timestamp}] 📥 Starting download ({content_length:,} bytes)...{RESET}")
+                            self.ota_start_time = time.time()
+                            self.ota_progress_data.clear()
+                    elif status == "progress":
+                        # Parse progress from message like "OTA Progress: 45% (123 chunks received)"
+                        if "OTA Progress:" in message and self.ota_start_time:
+                            try:
+                                percent_part = message.split("OTA Progress:")[1].strip()
+                                percent_str = percent_part.split("%")[0].strip()
+                                percentage = float(percent_str)
+                                elapsed_time = time.time() - self.ota_start_time
+                                
+                                # Calculate downloaded bytes and speed
+                                downloaded_bytes = (percentage / 100.0) * self.firmware_size
+                                speed_bps = downloaded_bytes / elapsed_time if elapsed_time > 0 else 0
+                                speed_kbps = speed_bps / 1024
+                                
+                                # Store progress data
+                                self.ota_progress_data.append((time.time(), percentage, downloaded_bytes, speed_bps))
+                                
+                                # Display progress with speed
+                                if speed_kbps > 1024:
+                                    speed_str = f"{speed_kbps/1024:.1f} MB/s"
+                                else:
+                                    speed_str = f"{speed_kbps:.1f} KB/s"
+                                
+                                print(f"{GREEN}[{timestamp}] 📈 Progress: {percentage:.1f}% - Speed: {speed_str}{RESET}")
+                                
+                            except Exception as e:
+                                print(f"{RED}[{timestamp}] ❌ Error parsing progress: {e}{RESET}")
                         else:
-                            speed_str = f"{speed_kbps:.1f} KB/s"
+                            print(f"{YELLOW}[{timestamp}] 📋 OTA: {message}{RESET}")
+                    elif status == "completed":
+                        self._show_ota_completion_stats()
+                        print(f"{GREEN}[{timestamp}] ✅ OTA Completed: {message}{RESET}")
+                    elif status == "error":
+                        error_msg = response_data.get("message", "Unknown error")
+                        print(f"{RED}[{timestamp}] ❌ OTA Error: {error_msg}{RESET}")
+                    else:
+                        print(f"{CYAN}[{timestamp}] 📋 OTA Status ({status}): {message}{RESET}")
                         
-                        print(f"{GREEN}[{timestamp}] 📈 Progress: {percentage:.1f}% - Speed: {speed_str}{RESET}")
-                    
-                except Exception as e:
-                    print(f"{RED}[{timestamp}] ❌ Error parsing OTA progress: {e}{RESET}")
-                    
-        elif self.selected_device and topic == f"{BASE_TOPIC}/{self.selected_device}/error":
-            print(f"{RED}[{timestamp}] ❌ Error: {payload}{RESET}")
-        elif self.selected_device and topic == f"{BASE_TOPIC}/{self.selected_device}/status":
-            if "OTA" in payload:
-                if "Starting OTA" in payload or "OTA started" in payload:
-                    self.ota_start_time = time.time()
-                    self.ota_progress_data.clear()
-                    print(f"{BLUE}[{timestamp}] 📝 Log: {payload.strip()}{RESET}")
-                elif "OTA completed" in payload or "OTA finished" in payload or "OTA update completed successfully" in payload:
-                    self._show_ota_completion_stats()
-                    print(f"{BLUE}[{timestamp}] 📝 Log: {payload.strip()}{RESET}")
+                elif "error" in response_data:
+                    error_msg = response_data.get("error", "Unknown error")
+                    print(f"{RED}[{timestamp}] ❌ OTA Error: {error_msg}{RESET}")
                 else:
-                    print(f"{BLUE}[{timestamp}] 📝 Log: {payload.strip()}{RESET}")
-            elif "restart" in payload.lower():
-                print(f"{BLUE}[{timestamp}] 📝 Log: {payload.strip()}{RESET}")
+                    print(f"{CYAN}[{timestamp}] 📋 OTA Response: {payload}{RESET}")
+                    
+            except json.JSONDecodeError:
+                # Fallback for non-JSON responses
+                print(f"{CYAN}[{timestamp}] 📋 OTA Response: {payload}{RESET}")
+            
+        # Handle restart response messages
+        elif self.selected_device and topic == f"{BASE_TOPIC}/{self.selected_device}/responses/restart":
+            try:
+                response_data = json.loads(payload)
+                if "status" in response_data:
+                    status = response_data["status"]
+                    message = response_data.get("message", "")
+                    print(f"{GREEN}[{timestamp}] 🔄 Restart: {message}{RESET}")
+                else:
+                    print(f"{GREEN}[{timestamp}] 🔄 Restart Response: {payload}{RESET}")
+            except json.JSONDecodeError:
+                print(f"{GREEN}[{timestamp}] � Restart Response: {payload}{RESET}")
+                
+        # Handle log messages (all levels)
+        elif self.selected_device and topic.startswith(f"{BASE_TOPIC}/{self.selected_device}/logs/"):
+            log_level = topic.split("/")[-1]  # Extract log level from topic
+            log_color = BLUE
+            if log_level == "error":
+                log_color = RED
+            elif log_level == "warning":
+                log_color = YELLOW
+            elif log_level == "info":
+                log_color = CYAN
+            
+            # Only show important logs to avoid spam
+            if log_level in ["error", "warning", "info"] and any(keyword in payload.lower() for keyword in ["ota", "restart", "firmware", "update", "download"]):
+                print(f"{log_color}[{timestamp}] 📝 {log_level.upper()}: {payload.strip()}{RESET}")
+            
+        # Fallback for any other status/error topics (backward compatibility)
+        elif self.selected_device and (topic.endswith("/status") or topic.endswith("/error")):
+            print(f"{CYAN}[{timestamp}] � {topic.split('/')[-1].upper()}: {payload}{RESET}")
         
         self.status_updates.append((timestamp, topic, payload))
         
@@ -252,8 +306,9 @@ class MQTTOTAUpdater:
         # Subscribe to device-specific topics
         if self.client:
             self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/status")
-            self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/error")
-            self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs")
+            self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/ota")
+            self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/restart")
+            self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs/+")
             print(f"{CYAN}📡 Subscribed to device topics{RESET}")
         
         return selected_device
@@ -282,8 +337,9 @@ class MQTTOTAUpdater:
                     # Subscribe to device-specific topics
                     if self.client:
                         self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/status")
-                        self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/error")
-                        self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs")
+                        self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/ota")
+                        self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/restart")
+                        self.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs/+")
                         print(f"{CYAN}📡 Subscribed to device topics{RESET}")
                     
                     return selected_device
@@ -307,17 +363,27 @@ class MQTTOTAUpdater:
         
         # Store firmware size for speed calculations
         self.firmware_size = firmware_size
-            
-        command = {"ota": firmware_url}
+        
+        # Create JSON command structure matching the C implementation
+        command = {
+            "id": self.ota_command_id,
+            "additional_data": {
+                "url": firmware_url
+            }
+        }
         command_json = json.dumps(command)
-        command_topic = f"{BASE_TOPIC}/{target_device}/command"
+        command_topic = f"{BASE_TOPIC}/{target_device}/commands/ota"
+        
+        print(f"{BLUE}📤 Sending OTA command to topic: {command_topic}{RESET}")
+        print(f"{BLUE}📋 Command: {command_json}{RESET}")
         
         result = self.client.publish(command_topic, command_json)
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             print(f"{GREEN}✅ OTA command sent to {target_device}: {firmware_url}{RESET}")
+            self.ota_command_id += 1  # Increment for next command
             return True
         else:
-            print(f"{RED}❌ Failed to send OTA command{RESET}")
+            print(f"{RED}❌ Failed to send OTA command (error code: {result.rc}){RESET}")
             return False
             
     def send_restart_command(self, device_id=None):
@@ -329,14 +395,24 @@ class MQTTOTAUpdater:
         if not target_device:
             print(f"{RED}❌ No device selected{RESET}")
             return False
-            
-        command_topic = f"{BASE_TOPIC}/{target_device}/command"
-        result = self.client.publish(command_topic, "restart")
+        
+        # Create JSON command structure matching the C implementation
+        command = {
+            "id": self.ota_command_id
+        }
+        command_json = json.dumps(command)
+        command_topic = f"{BASE_TOPIC}/{target_device}/commands/restart"
+        
+        print(f"{BLUE}📤 Sending restart command to topic: {command_topic}{RESET}")
+        print(f"{BLUE}📋 Command: {command_json}{RESET}")
+        
+        result = self.client.publish(command_topic, command_json)
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             print(f"{GREEN}✅ Restart command sent to {target_device}{RESET}")
+            self.ota_command_id += 1  # Increment for next command
             return True
         else:
-            print(f"{RED}❌ Failed to send restart command{RESET}")
+            print(f"{RED}❌ Failed to send restart command (error code: {result.rc}){RESET}")
             return False
             
     def disconnect(self):
@@ -454,8 +530,10 @@ def main():
         print(f"{GREEN}🎯 Targeting specific device: {selected_device}{RESET}")
         # Subscribe to device-specific topics
         mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/status")
-        mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/error")
-        mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs")
+        mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/ota")
+        mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/responses/restart")
+        mqtt_updater.client.subscribe(f"{BASE_TOPIC}/{selected_device}/logs/+")
+        print(f"{CYAN}📡 Subscribed to device topics{RESET}")
     else:
         # Discover devices
         print(f"\n{CYAN}🔍 Discovering active devices...{RESET}")
@@ -550,22 +628,38 @@ def main():
             # Monitor for completion
             start_time = time.time()
             timeout = 300  # 5 minutes timeout
+            ota_completed = False
             
             while time.time() - start_time < timeout:
                 time.sleep(1)
                 
-                # Check for restart or completion messages
-                for timestamp, topic, payload in mqtt_updater.status_updates[-5:]:
-                    if "restarting" in payload.lower() or "restart" in payload.lower():
-                        print(f"\n{GREEN}🎉 OTA update completed successfully!{RESET}")
-                        print(f"{GREEN}🔄 Device {selected_device} is restarting with new firmware{RESET}")
+                # Check for completion or restart messages in recent updates
+                for timestamp, topic, payload in mqtt_updater.status_updates[-10:]:
+                    # Check for OTA completion
+                    if topic.endswith("/responses/ota"):
+                        try:
+                            response_data = json.loads(payload)
+                            if response_data.get("status") == "completed":
+                                print(f"\n{GREEN}🎉 OTA update completed successfully!{RESET}")
+                                ota_completed = True
+                                break
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    # Check for restart messages
+                    elif ("restart" in payload.lower() or "reboot" in payload.lower()) and "graceful" in payload.lower():
+                        print(f"\n{GREEN}🔄 Device {selected_device} is restarting with new firmware{RESET}")
+                        ota_completed = True
                         break
-                else:
-                    continue
-                break
-            else:
+                        
+                if ota_completed:
+                    break
+            
+            if not ota_completed:
                 print(f"\n{YELLOW}⏰ OTA update timeout reached{RESET}")
                 print(f"{YELLOW}Check device logs for more information{RESET}")
+            else:
+                print(f"{GREEN}✅ OTA process completed successfully!{RESET}")
         
     except KeyboardInterrupt:
         print(f"\n{YELLOW}⚠️ Operation cancelled by user{RESET}")

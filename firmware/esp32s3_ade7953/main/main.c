@@ -180,7 +180,7 @@ void app_main(void)
         if (loop_count % 10 == 0) {
             float frequency = ade7953_get_latest_frequency(&ade7953_handle);
             float voltage = ade7953_get_latest_voltage(&ade7953_handle);
-            ESP_LOGI(TAG, "Frequency: %.3f Hz | Voltage: %.1f V", loop_count, frequency, voltage);
+            ESP_LOGI(TAG, "Frequency: %.3f Hz | Voltage: %.1f V", frequency, voltage);
         }
 
         // Wait before next reading (1 second for status monitoring)

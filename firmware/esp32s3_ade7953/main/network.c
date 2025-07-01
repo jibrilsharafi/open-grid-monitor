@@ -15,6 +15,7 @@ static vprintf_like_t g_original_log_function = NULL;
 static TaskHandle_t g_rollback_check_task = NULL;
 static bool g_time_synced = false;
 static TaskHandle_t g_deferred_shutdown_task = NULL;
+static bool g_mqtt_connected = false;
 
 // Forward declarations
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
@@ -272,7 +273,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT client connected");
-            
+            g_mqtt_connected = true;
+
+            // Wait for a moment to ensure stable connection
+            vTaskDelay(pdMS_TO_TICKS(100));
+
             // Flush any buffered logs first
             if (g_network_handle) {
                 network_flush_log_buffer(g_network_handle);
@@ -292,9 +297,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                 ESP_LOGI(TAG, "MQTT command topics subscribed");
             }
+            
+            led_set_status(g_network_handle->led_handle, LED_STATUS_WORKING);
+
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT client disconnected");
+            g_mqtt_connected = false;
+            led_set_status(g_network_handle->led_handle, LED_STATUS_COMMUNICATION_ERROR);
             break;
         case MQTT_EVENT_SUBSCRIBED:
             ESP_LOGI(TAG, "MQTT subscribed, msg_id=%d", event->msg_id);
@@ -487,7 +497,7 @@ static void mqtt_logging_task(void *pvParameters) {
     while (handle->mqtt_logging_enabled) {
         // Check for log messages in queue
         if (xQueueReceive(handle->log_queue, &log_msg, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (handle->status == WIFI_STATUS_CONNECTED && log_msg.msg != NULL) {
+            if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_connected && log_msg.msg != NULL) {
                 // Forward log message via MQTT
                 const char *topic = log_msg.topic ? log_msg.topic : handle->mqtt_topic_logs;
                 esp_mqtt_client_publish(g_mqtt_client, topic, log_msg.msg, 0, QOS_0, 0);
@@ -503,7 +513,7 @@ static void mqtt_logging_task(void *pvParameters) {
         }
         
         // Publish system information periodically
-        if (handle->status == WIFI_STATUS_CONNECTED &&
+        if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_connected &&
             (xTaskGetTickCount() - system_info_timer) > pdMS_TO_TICKS(MQTT_STATUS_INTERVAL)) {
             
             snprintf(system_info, sizeof(system_info), 
@@ -607,7 +617,7 @@ static void measurement_publishing_task(void *pvParameters) {
     while (handle->measurement_publishing_enabled) {
         // Wait for measurement data
         if (xQueueReceive(handle->measurement_queue, &measurement, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_client) {
+            if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_connected && g_mqtt_client) {
                 // Create JSON payload
                 cJSON *json = cJSON_CreateObject();
                 if (json != NULL) {
@@ -684,7 +694,7 @@ esp_err_t network_init(network_handle_t *handle) {
     }
     
     // Set MQTT client ID using MAC address
-    snprintf(handle->mqtt_client_id, sizeof(handle->mqtt_client_id), "grid_monitor_%s", handle->mac_address);
+    snprintf(handle->mqtt_client_id, sizeof(handle->mqtt_client_id), "open_grid_monitor_%s", handle->mac_address);
     
     // Initialize MQTT topics with MAC address as second element using defined topic suffixes
     snprintf(handle->mqtt_topic_logs, sizeof(handle->mqtt_topic_logs), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_LOGS);
@@ -696,7 +706,7 @@ esp_err_t network_init(network_handle_t *handle) {
     snprintf(handle->mqtt_topic_responses_restart, sizeof(handle->mqtt_topic_responses_restart), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_RESPONSES, MQTT_TOPIC_COMMAND_RESTART);
     snprintf(handle->mqtt_topic_responses_ota, sizeof(handle->mqtt_topic_responses_ota), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_RESPONSES, MQTT_TOPIC_COMMAND_OTA);
     snprintf(handle->mqtt_topic_firmware, sizeof(handle->mqtt_topic_firmware), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_FIRMWARE);
-    ESP_LOGI(TAG, "MAC address: %s", handle->mac_address);
+    ESP_LOGI(TAG, "MAC address (formatted): %s", handle->mac_address);
     ESP_LOGI(TAG, "MQTT client ID: %s", handle->mqtt_client_id);
     
     // Don't setup log forwarding here to prevent stack overflow during WiFi init
@@ -1019,6 +1029,7 @@ esp_err_t network_stop_mqtt_logging(network_handle_t *handle) {
     // Stop MQTT client gracefully
     if (g_mqtt_client) {
         ESP_LOGI(TAG, "Stopping MQTT client gracefully...");
+        g_mqtt_connected = false;
         esp_mqtt_client_stop(g_mqtt_client);
         vTaskDelay(pdMS_TO_TICKS(500)); // Allow time for proper disconnect
         esp_mqtt_client_destroy(g_mqtt_client);
@@ -1081,6 +1092,11 @@ const char* network_get_ip_address(network_handle_t *handle) {
 // Check if connected
 bool network_is_connected(network_handle_t *handle) {
     return handle && handle->status == WIFI_STATUS_CONNECTED;
+}
+
+// Check if MQTT is connected
+bool network_is_mqtt_connected(void) {
+    return g_mqtt_connected && g_mqtt_client != NULL;
 }
 
 // UDP log function
@@ -1902,7 +1918,7 @@ esp_err_t network_publish_firmware_info(network_handle_t *handle) {
     char *json_string = cJSON_Print(json);
     if (json_string) {
         safe_publish_mqtt(handle->mqtt_topic_firmware, json_string, QOS_1, 0);
-        ESP_LOGI(TAG, "Firmware info published: version %s, OTA state %s", 
+        ESP_LOGI(TAG, "Firmware info published: version %s, OTA state: %s", 
                  app_desc->version, ota_state_to_string(ota_state));
         free(json_string);
     }
@@ -1936,12 +1952,15 @@ esp_err_t safe_publish_mqtt(const char *topic, const char *message, int qos, int
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_mqtt_client) {
+    if (g_mqtt_client && g_mqtt_connected) {
         esp_err_t ret = esp_mqtt_client_publish(g_mqtt_client, topic, message, 0, qos, retain);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to publish MQTT message: %s", esp_err_to_name(ret));
             return ret;
         }
+    } else {
+        ESP_LOGD(TAG, "MQTT not connected, skipping publish to topic: %s", topic);
+        return ESP_ERR_INVALID_STATE;
     }
 
     return ESP_OK;
@@ -1952,12 +1971,15 @@ esp_err_t safe_publish_mqtt_default(const char *topic, const char *message) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (g_mqtt_client) {
+    if (g_mqtt_client && g_mqtt_connected) {
         esp_err_t ret = esp_mqtt_client_publish(g_mqtt_client, topic, message, 0, QOS_0, 0);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to publish MQTT message: %s", esp_err_to_name(ret));
             return ret;
         }
+    } else {
+        ESP_LOGD(TAG, "MQTT not connected, skipping publish to topic: %s", topic);
+        return ESP_ERR_INVALID_STATE;
     }
 
     return ESP_OK;
