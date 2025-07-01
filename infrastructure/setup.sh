@@ -3,6 +3,11 @@
 # Setup script for Open Grid Monitor infrastructure
 # This script initializes the MQTT password file, starts services, and configures InfluxDB token
 # 
+# This script generates the datasource configuration dynamically and uses static dashboard files:
+# - Generates grafana-provisioning/datasources/datasource.yml with actual credentials
+# - Uses static dashboard configurations from grafana-provisioning/dashboards/
+# - Creates Telegraf runtime configuration with actual MQTT/InfluxDB credentials
+#
 # This script is idempotent - it can be run multiple times safely and will only make
 # necessary changes, skipping steps that are already completed correctly.
 #
@@ -67,7 +72,7 @@ if [ "$CLEAN_INSTALL" = true ]; then
     # Remove generated configuration files
     echo "  - Removing generated configurations..."
     rm -f telegraf/telegraf-open-grid-monitor-runtime.conf 2>/dev/null || true
-    rm -f grafana/provisioning/datasources/influxdb.yml 2>/dev/null || true
+    rm -f grafana-provisioning/datasources/datasource.yml 2>/dev/null || true
     rm -f mosquitto/config/passwd 2>/dev/null || true
     
     # Reset InfluxDB token in .env file
@@ -116,10 +121,26 @@ mkdir -p mosquitto/data
 mkdir -p mosquitto/log
 mkdir -p influxdb
 mkdir -p grafana
-mkdir -p grafana/provisioning/datasources
-mkdir -p grafana/provisioning/dashboards
-mkdir -p grafana/dashboards
 mkdir -p telegraf
+
+# Ensure grafana-provisioning directories exist
+mkdir -p grafana-provisioning/datasources
+mkdir -p grafana-provisioning/dashboards
+
+# Verify dashboard configuration files exist
+if [ ! -f "grafana-provisioning/dashboards/dashboard.yml" ]; then
+    echo "❌ Error: Dashboard configuration not found!"
+    echo "Expected to find: grafana-provisioning/dashboards/dashboard.yml"
+    exit 1
+fi
+
+if [ ! -f "grafana-provisioning/dashboards/open-grid-monitor-dashboard.json" ]; then
+    echo "❌ Error: Dashboard JSON not found!"
+    echo "Expected to find: grafana-provisioning/dashboards/open-grid-monitor-dashboard.json"
+    exit 1
+fi
+
+echo "✅ Static dashboard configuration files verified"
 
 # Generate MQTT password file
 echo "🔐 Creating MQTT user credentials..."
@@ -281,31 +302,39 @@ echo "✅ Telegraf configuration updated with credentials"
 echo "🔄 Restarting Telegraf with new configuration..."
 docker-compose restart telegraf-open-grid-monitor
 
-# Create Grafana datasource configuration with actual credentials
-echo "📊 Configuring Grafana datasource with credentials..."
+# Generate Grafana datasource configuration with actual credentials
+echo "📊 Generating Grafana datasource configuration..."
 
-# Only regenerate if runtime config doesn't exist or template has changed
-if [ ! -f grafana/provisioning/datasources/influxdb.yml ] || [ grafana/influxdb-datasource-template.yml -nt grafana/provisioning/datasources/influxdb.yml ]; then
-    sed -e "s/INFLUXDB_TOKEN_PLACEHOLDER/${INFLUXDB_TOKEN}/g" \
-        -e "s/INFLUXDB_ORG_PLACEHOLDER/${INFLUXDB_ORG}/g" \
-        -e "s/INFLUXDB_BUCKET_PLACEHOLDER/${INFLUXDB_BUCKET}/g" \
-        grafana/influxdb-datasource-template.yml > grafana/provisioning/datasources/influxdb.yml
-    
-    echo "✅ Grafana datasource configuration updated"
-    
-    # Restart Grafana to pick up new configuration
-    echo "🔄 Restarting Grafana with new configuration..."
-    docker-compose restart grafana
-else
-    echo "✅ Grafana datasource configuration already up to date"
-fi
+# Create datasource.yml with actual values
+cat > grafana-provisioning/datasources/datasource.yml << EOF
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB_v2_Flux
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: ${INFLUXDB_ORG}
+      defaultBucket: ${INFLUXDB_BUCKET}
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ${INFLUXDB_TOKEN}
+EOF
+
+echo "✅ Grafana datasource configuration generated"
+
+# Restart Grafana to pick up new configuration
+echo "🔄 Restarting Grafana with new configuration..."
+docker-compose restart grafana
 
 echo ""
 echo "🎉 Setup complete!"
 echo ""
 echo "📊 Services are available at:"
 echo "  - Grafana: http://localhost:3000 (admin/${GRAFANA_ADMIN_PASSWORD})"
-echo "    └─ Open Grid Monitor dashboard is pre-installed and ready to use!"
+echo "    └─ Dashboard configured: Open Grid Monitor"
 echo "  - InfluxDB: http://localhost:8086 (${INFLUXDB_ADMIN_USERNAME}/${INFLUXDB_ADMIN_PASSWORD})"
 echo "  - MQTT: localhost:1883 (${MQTT_USERNAME}/${MQTT_PASSWORD})"
 echo "  - MQTT WebSocket: localhost:9001"
@@ -321,15 +350,16 @@ echo "  - Device status: open_grid_monitor/{device_id}/status"
 echo "  - Device logs: open_grid_monitor/{device_id}/logs"
 echo ""
 echo "📊 Dashboard Information:"
-echo "  - Dashboard: 'Open Grid Monitor' is pre-installed in Grafana"
-echo "  - Features: Frequency/voltage monitoring with safety thresholds"
-echo "  - Device selection: Use the dropdown to filter by device_id"
-echo "  - Data retention: Configured for real-time monitoring"
+echo "  - Dashboard: 'Open Grid Monitor' is available in Grafana"
+echo "  - Features: Real-time and historical monitoring"
+echo "  - Data source: Connected to InfluxDB with organization '${INFLUXDB_ORG}'"
+echo "  - Data retention: Configured for monitoring in bucket '${INFLUXDB_BUCKET}'"
 echo ""
 echo "🔧 Next Steps:"
 echo "  1. Configure your ESP32S3 device with MQTT credentials"
 echo "  2. Start publishing data to the MQTT topics above"
-echo "  3. Visit Grafana to see real-time grid monitoring"
+echo "  3. Visit Grafana to see your configured dashboards"
+echo "  4. Create additional dashboards as needed for your grid monitoring"
 echo ""
 echo "💡 Setup Script Usage:"
 echo "  ./setup.sh         - Normal setup (idempotent)"

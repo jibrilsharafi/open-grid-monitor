@@ -3,6 +3,7 @@
 
 # Runtime configuration files
 telegraf/telegraf-*-runtime.conf
+grafana-provisioning/datasources/datasource.yml
 
 # Data directories
 mosquitto/data/
