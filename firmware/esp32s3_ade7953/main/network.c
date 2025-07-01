@@ -27,10 +27,13 @@ static void rollback_check_task(void *pvParameters);
 static void deferred_shutdown_task(void *pvParameters);
 static void add_to_log_buffer(network_handle_t *handle, const char *message, const char *topic);
 static void add_to_log_buffer(network_handle_t *handle, const char *message, const char *topic);
-static void handle_mqtt_command(const char *command);
-static esp_err_t perform_mqtt_ota(const char *url);
+static void handle_mqtt_command(const char *command, mqtt_command_t cmd_type);
+static esp_err_t perform_mqtt_ota(const char *url, int command_id);
 static const char* ota_state_to_string(esp_ota_img_states_t state);
 static void sntp_sync_notification_cb(struct timeval *tv);
+esp_err_t safe_publish_mqtt(const char *topic, const char *message, int qos, int retain);
+esp_err_t safe_publish_mqtt_default(const char *topic, const char *message);
+const char* cmd_type_to_name(mqtt_command_t cmd_type);
 
 // Custom vprintf implementation - MUST BE FAST AND NON-BLOCKING
 static int custom_log_writer(const char *fmt, va_list args)
@@ -132,22 +135,27 @@ static int custom_log_writer(const char *fmt, va_list args)
 // WiFi event handler
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     network_handle_t *handle = (network_handle_t *)arg;
-    
+
+    // Just starting to connect
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         handle->status = WIFI_STATUS_CONNECTING;
         ESP_LOGI(TAG, "WiFi station started, connecting...");
+    // We got disconnected
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Try to reconnect
         if (handle->retry_count < WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             handle->retry_count++;
             handle->status = WIFI_STATUS_CONNECTING;
             ESP_LOGI(TAG, "Retry to connect to WiFi (%d/%d)", handle->retry_count, WIFI_MAXIMUM_RETRY);
+        // Too many retries, give up
         } else {
             xEventGroupSetBits(handle->wifi_event_group, WIFI_FAIL_BIT);
             handle->status = WIFI_STATUS_FAILED;
             ESP_LOGE(TAG, "Failed to connect to WiFi after %d attempts", WIFI_MAXIMUM_RETRY);
         }
+    // We got an IP address
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         snprintf(handle->ip_address, sizeof(handle->ip_address), IPSTR, IP2STR(&event->ip_info.ip));
@@ -177,6 +185,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
         return ESP_FAIL;
     }
+    ESP_LOGD(TAG, "OTA partition found: %s", ota_partition->label);
 
     while (remaining > 0) {
         received = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
@@ -236,7 +245,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
     httpd_resp_sendstr(req, "OTA update successful, restarting gracefully...");
     
     // Allow HTTP response to be sent
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Perform graceful restart
     esp_err_t shutdown_err = network_graceful_shutdown_and_restart(g_network_handle, "HTTP OTA update completed");
@@ -276,8 +285,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             // Subscribe to command topic if command handling is enabled
             if (g_network_handle && g_network_handle->mqtt_commands_enabled) {
-                int msg_id = esp_mqtt_client_subscribe(g_mqtt_client, g_network_handle->mqtt_topic_command, 0);
-                ESP_LOGI(TAG, "Subscribed to command topic, msg_id=%d", msg_id);
+                int msg_id = esp_mqtt_client_subscribe(g_mqtt_client, g_network_handle->mqtt_topic_commands_restart, 0);
+                ESP_LOGD(TAG, "Subscribed to command topic, msg_id=%d", msg_id);
+                msg_id = esp_mqtt_client_subscribe(g_mqtt_client, g_network_handle->mqtt_topic_commands_ota, 0);
+                ESP_LOGD(TAG, "Subscribed to OTA command topic, msg_id=%d", msg_id);
+
+                ESP_LOGI(TAG, "MQTT command topics subscribed");
             }
             break;
         case MQTT_EVENT_DISCONNECTED:
@@ -292,16 +305,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "MQTT data received");
             // Check if this is a command message
-            if (event && event->topic && event->topic_len > 0 && g_network_handle &&
-                strncmp(event->topic, g_network_handle->mqtt_topic_command, strlen(g_network_handle->mqtt_topic_command)) == 0) {
+            if (event && event->topic && event->topic_len > 0 && g_network_handle) {
+                
+                mqtt_command_t cmd_type;
+                if (strncmp(event->topic, g_network_handle->mqtt_topic_commands_restart, strlen(g_network_handle->mqtt_topic_commands_restart)) == 0) {
+                    cmd_type = MQTT_COMMAND_RESTART;
+                } else if (strncmp(event->topic, g_network_handle->mqtt_topic_commands_ota, strlen(g_network_handle->mqtt_topic_commands_ota)) == 0) {
+                    cmd_type = MQTT_COMMAND_OTA;
+                } else {
+                    ESP_LOGW(TAG, "Received MQTT data on unknown topic: %.*s", event->topic_len, event->topic);
+                    break;
+                }
+
                 // Null-terminate the data for safe string handling
                 if (event->data && event->data_len > 0) {
-                    char command[64];
-                    int len = MIN(event->data_len, sizeof(command) - 1);
-                    strncpy(command, event->data, len);
-                    command[len] = '\0';
-                    ESP_LOGI(TAG, "Received command: %s", command);
-                    handle_mqtt_command(command);
+                    char json_command[MQTT_COMMAND_PAYLOAD_LEN];
+                    int len = MIN(event->data_len, sizeof(json_command) - 1);
+                    strncpy(json_command, event->data, len);
+                    json_command[len] = '\0';
+                    ESP_LOGI(TAG, "Received command (type=%d): %s", cmd_type, json_command);
+                    // Pass both the command type and the message
+                    // You may want to update handle_mqtt_command to accept the enum as an argument
+                    handle_mqtt_command(json_command, cmd_type);
                 } else {
                     ESP_LOGW(TAG, "Received command message with no data");
                 }
@@ -316,78 +341,138 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 }
 
 // MQTT command handler
-static void handle_mqtt_command(const char *command)
+static void handle_mqtt_command(const char *json_command, mqtt_command_t cmd_type)
 {
-    if (command == NULL) {
+    if (json_command == NULL) {
         ESP_LOGW(TAG, "Received null command");
         return;
     }
+
+    const char* response_topic = NULL;
+    switch (cmd_type)
+    {
+    case MQTT_COMMAND_RESTART:
+        response_topic = g_network_handle->mqtt_topic_responses_restart;
+        break;
+    case MQTT_COMMAND_OTA:
+        response_topic = g_network_handle->mqtt_topic_responses_ota;
+        break;
+    default:
+        ESP_LOGW(TAG, "Unknown MQTT command type: %d", cmd_type);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Processing MQTT command: %s", json_command);
+    int command_id = MQTT_COMMAND_DEFAULT_ID;
+
+    // Ensure it is a JSON
+    if (strncmp(json_command, "{", 1) != 0) {
+        ESP_LOGW(TAG, "Unknown command format received (expected JSON): %s", json_command);
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"Unknown command format (expected JSON)\"}", command_id);
+        safe_publish_mqtt_default(response_topic, error_msg);
+        return;
+    }
     
-    ESP_LOGI(TAG, "Processing MQTT command: %s", command);
+
+    cJSON *json = cJSON_Parse(json_command);
+    if (json == NULL) {
+        ESP_LOGW(TAG, "Failed to parse JSON command: %s", json_command);
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"Failed to parse JSON command\"}", command_id);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+        cJSON_Delete(json);
+        return;
+    }
+
+    // Extract id
+    cJSON *id = cJSON_GetObjectItem(json, "id");
+    if (id == NULL || !cJSON_IsNumber(id)) {
+        ESP_LOGW(TAG, "JSON command missing 'id' field");
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"Missing 'id' field\"}", command_id);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+        cJSON_Delete(json);
+        return;
+    }
+    command_id = cJSON_GetNumberValue(id);
+
+    // Extract additional_data (optional)
+    cJSON *additional_data = cJSON_GetObjectItem(json, "additional_data");
     
-    if (strcmp(command, MQTT_COMMAND_RESTART) == 0) {
-        ESP_LOGW(TAG, "Restart command received via MQTT - scheduling graceful restart...");
+    // Handle different command types
+    if (cmd_type == MQTT_COMMAND_RESTART) {
+        ESP_LOGW(TAG, "JSON restart command received via MQTT - scheduling graceful restart...");
         
         // Send confirmation back via MQTT if possible
-        if (g_mqtt_client && g_network_handle) {
-            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, 
-                                  "Restart command received, performing graceful restart", 0, 0, 0);
-        }
-        
+        char status_msg[128];
+        snprintf(status_msg, sizeof(status_msg), "{\"id\": %d, \"status\":\"JSON restart command received, performing graceful restart\"}", command_id);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_status, status_msg);
+
         // Schedule deferred restart to avoid MQTT task deadlock
-        esp_err_t defer_err = network_schedule_deferred_restart("MQTT restart command");
+        esp_err_t defer_err = network_schedule_deferred_restart("MQTT JSON restart command");
+
         if (defer_err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to schedule deferred restart: %s", esp_err_to_name(defer_err));
+            
+            char error_msg[128];
+            snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"Failed to schedule deferred restart\"}", command_id);
+            safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_restart, error_msg);
+
             // Fallback to immediate restart with delay
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_restart();
         }
-    } else if (strncmp(command, "{", 1) == 0) {
-        // Try to parse as JSON command (for OTA)
-        cJSON *json = cJSON_Parse(command);
-        if (json != NULL) {
-            cJSON *ota_cmd = cJSON_GetObjectItem(json, "ota");
-            if (ota_cmd != NULL && cJSON_IsString(ota_cmd)) {
-                char *url = cJSON_GetStringValue(ota_cmd);
+
+    } else if (cmd_type == MQTT_COMMAND_OTA) {
+        // Handle OTA command
+        if (additional_data == NULL) {
+            ESP_LOGW(TAG, "OTA command missing additional_data");
+            char error_msg[128];
+            snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"OTA command missing additional_data\"}", command_id);
+            safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+        } else {
+            cJSON *url_item = cJSON_GetObjectItem(additional_data, "url");
+            if (url_item != NULL && cJSON_IsString(url_item)) {
+                char *url = cJSON_GetStringValue(url_item);
                 if (url != NULL && strlen(url) > 0) {
-                    ESP_LOGI(TAG, "OTA command received via MQTT, URL: %s", url);
+                    ESP_LOGI(TAG, "JSON OTA command received via MQTT, URL: %s", url);
                     
                     // Send status update
-                    if (g_mqtt_client && g_network_handle) {
-                        char status_msg[256];
-                        snprintf(status_msg, sizeof(status_msg), "Starting OTA update from: %s", url);
-                        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, status_msg, 0, 0, 0);
-                    }
+                    char status_msg[256];
+                    snprintf(status_msg, sizeof(status_msg), "{\"id\": %d, \"status\":\"Starting OTA update from: %s\"}", command_id, url);
+                    safe_publish_mqtt_default(g_network_handle->mqtt_topic_status, status_msg);
                     
                     // Perform OTA update
-                    esp_err_t ota_ret = perform_mqtt_ota(url);
+                    esp_err_t ota_ret = perform_mqtt_ota(url, command_id);
                     if (ota_ret != ESP_OK) {
                         ESP_LOGE(TAG, "MQTT OTA failed: %s", esp_err_to_name(ota_ret));
-                        if (g_mqtt_client && g_network_handle) {
-                            char error_msg[128];
-                            snprintf(error_msg, sizeof(error_msg), "OTA update failed: %s", esp_err_to_name(ota_ret));
-                            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-                        }
+                        char error_msg[128];
+                        snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"OTA update failed: %s\"}", command_id, esp_err_to_name(ota_ret));
+                        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
                     }
+                } else {
+                    ESP_LOGW(TAG, "OTA command has empty or invalid URL");
+                    char error_msg[128];
+                    snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"OTA command has empty or invalid URL\"}", command_id);
+                    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
                 }
-            }
-            cJSON_Delete(json);
-        } else {
-            ESP_LOGW(TAG, "Failed to parse JSON command: %s", command);
-            if (g_mqtt_client && g_network_handle) {
-                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, "Invalid JSON command format", 0, 0, 0);
+            } else {
+                ESP_LOGW(TAG, "OTA command missing 'url' in additional_data");
+                char error_msg[128];
+                snprintf(error_msg, sizeof(error_msg), "{\"id\": %d, \"error\":\"OTA command missing 'url' in additional_data\"}", command_id);
+                safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
             }
         }
     } else {
-        ESP_LOGW(TAG, "Unknown MQTT command received: %s", command);
-        
-        // Send error response back via MQTT if possible
-        if (g_mqtt_client && g_network_handle) {
-            char error_msg[128];
-            snprintf(error_msg, sizeof(error_msg), "Unknown command: %s", command);
-            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-        }
+        ESP_LOGW(TAG, "Unknown JSON command received: %s", cmd_type_to_name(cmd_type));
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "Unknown JSON command: %s", cmd_type_to_name(cmd_type));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
     }
+    
+    cJSON_Delete(json);
 }
 
 // MQTT logging task
@@ -402,10 +487,10 @@ static void mqtt_logging_task(void *pvParameters) {
     while (handle->mqtt_logging_enabled) {
         // Check for log messages in queue
         if (xQueueReceive(handle->log_queue, &log_msg, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_client && log_msg.msg != NULL) {
+            if (handle->status == WIFI_STATUS_CONNECTED && log_msg.msg != NULL) {
                 // Forward log message via MQTT
                 const char *topic = log_msg.topic ? log_msg.topic : handle->mqtt_topic_logs;
-                esp_mqtt_client_publish(g_mqtt_client, topic, log_msg.msg, 0, 0, 0);
+                esp_mqtt_client_publish(g_mqtt_client, topic, log_msg.msg, 0, QOS_0, 0);
             }
             
             // Free the allocated message memory
@@ -417,20 +502,21 @@ static void mqtt_logging_task(void *pvParameters) {
             }
         }
         
-        // Publish system information every 30 seconds
-        if (handle->status == WIFI_STATUS_CONNECTED && g_mqtt_client &&
-            (xTaskGetTickCount() - system_info_timer) > pdMS_TO_TICKS(30000)) {
+        // Publish system information periodically
+        if (handle->status == WIFI_STATUS_CONNECTED &&
+            (xTaskGetTickCount() - system_info_timer) > pdMS_TO_TICKS(MQTT_STATUS_INTERVAL)) {
             
             snprintf(system_info, sizeof(system_info), 
-                "{\"device\":\"grid_frequency_monitor\",\"ip\":\"%s\",\"uptime\":%lu,\"free_heap\":%lu,\"timestamp\":%llu}",
+                "{\"device\":\"open_grid_monitor\",\"ip\":\"%s\",\"uptime\":%lu,\"free_heap\":%lu,\"timestamp\":%llu}",
                 handle->ip_address, 
                 xTaskGetTickCount() * portTICK_PERIOD_MS / 1000, 
                 esp_get_free_heap_size(),
-                time(NULL));
+                time(NULL)
+            );
             
-            esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_system, system_info, 0, 0, 0);
+            safe_publish_mqtt_default(handle->mqtt_topic_system, system_info);
             system_info_timer = xTaskGetTickCount();
-            ESP_LOGD(TAG, "Published system info to MQTT");
+            ESP_LOGD(TAG, "Published system info to %s", handle->mqtt_topic_system);
         }
     }
     
@@ -532,7 +618,7 @@ static void measurement_publishing_task(void *pvParameters) {
                     char *json_string = cJSON_Print(json);
                     if (json_string != NULL) {
                         // Publish to MQTT
-                        esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_measurement, json_string, 0, 0, 0);
+                        esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_measurement, json_string, 0, QOS_0, 0);
                         free(json_string);
                     }
                     cJSON_Delete(json);
@@ -605,9 +691,10 @@ esp_err_t network_init(network_handle_t *handle) {
     snprintf(handle->mqtt_topic_status, sizeof(handle->mqtt_topic_status), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_STATUS);
     snprintf(handle->mqtt_topic_measurement, sizeof(handle->mqtt_topic_measurement), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_MEASUREMENT);
     snprintf(handle->mqtt_topic_system, sizeof(handle->mqtt_topic_system), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_SYSTEM);
-    snprintf(handle->mqtt_topic_error, sizeof(handle->mqtt_topic_error), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_ERROR);
-    snprintf(handle->mqtt_topic_debug, sizeof(handle->mqtt_topic_debug), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_DEBUG);
-    snprintf(handle->mqtt_topic_command, sizeof(handle->mqtt_topic_command), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_COMMAND);
+    snprintf(handle->mqtt_topic_commands_restart, sizeof(handle->mqtt_topic_commands_restart), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_COMMANDS, MQTT_TOPIC_COMMAND_RESTART);
+    snprintf(handle->mqtt_topic_commands_ota, sizeof(handle->mqtt_topic_commands_ota), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_COMMANDS, MQTT_TOPIC_COMMAND_OTA);
+    snprintf(handle->mqtt_topic_responses_restart, sizeof(handle->mqtt_topic_responses_restart), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_RESPONSES, MQTT_TOPIC_COMMAND_RESTART);
+    snprintf(handle->mqtt_topic_responses_ota, sizeof(handle->mqtt_topic_responses_ota), "%s/%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_RESPONSES, MQTT_TOPIC_COMMAND_OTA);
     snprintf(handle->mqtt_topic_firmware, sizeof(handle->mqtt_topic_firmware), "%s/%s/%s", MQTT_TOPIC_BASE, handle->mac_address, MQTT_TOPIC_FIRMWARE);
     ESP_LOGI(TAG, "MAC address: %s", handle->mac_address);
     ESP_LOGI(TAG, "MQTT client ID: %s", handle->mqtt_client_id);
@@ -877,7 +964,7 @@ esp_err_t network_start_mqtt_logging(network_handle_t *handle) {
         return ret;
     }
     
-    BaseType_t task_ret = xTaskCreate(mqtt_logging_task, "mqtt_log", MQTT_TASK_STACK_SIZE, handle, MQTT_TASK_PRIORITY, &g_mqtt_log_task);
+    BaseType_t task_ret = xTaskCreate(mqtt_logging_task, MQTT_TASK_NAME, MQTT_TASK_STACK_SIZE, handle, MQTT_TASK_PRIORITY, &g_mqtt_log_task);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create MQTT logging task");
         handle->mqtt_logging_enabled = false;
@@ -972,7 +1059,8 @@ esp_err_t network_stop_mqtt_commands(network_handle_t *handle) {
     
     // Unsubscribe from command topic if MQTT client is available
     if (g_mqtt_client) {
-        esp_mqtt_client_unsubscribe(g_mqtt_client, handle->mqtt_topic_command);
+        esp_mqtt_client_unsubscribe(g_mqtt_client, handle->mqtt_topic_commands_restart);
+        esp_mqtt_client_unsubscribe(g_mqtt_client, handle->mqtt_topic_commands_ota);
         ESP_LOGI(TAG, "Requested unsubscribe from command topic");
     }
     
@@ -1225,7 +1313,7 @@ esp_err_t network_schedule_deferred_restart(const char *reason) {
 }
 
 // MQTT OTA implementation with progress updates
-static esp_err_t perform_mqtt_ota(const char *url)
+static esp_err_t perform_mqtt_ota(const char *url, int command_id)
 {
     esp_ota_handle_t ota_handle = 0;
     const esp_partition_t *ota_partition = NULL;
@@ -1242,13 +1330,18 @@ static esp_err_t perform_mqtt_ota(const char *url)
     }
 
     // Send initial status
-    if (g_mqtt_client && g_network_handle) {
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, "Connecting to OTA server...", 0, 0, 0);
-    }
+    char status_msg[128];
+    snprintf(status_msg, sizeof(status_msg), "{\"id\":%d,\"status\":\"connecting\",\"url\":\"%s\"}", command_id, url);
+    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, status_msg);
 
     err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"%s\"}", command_id, esp_err_to_name(err));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         esp_http_client_cleanup(client);
         return err;
     }
@@ -1256,22 +1349,28 @@ static esp_err_t perform_mqtt_ota(const char *url)
     int content_length = esp_http_client_fetch_headers(client);
     if (content_length <= 0) {
         ESP_LOGE(TAG, "Invalid content length: %d", content_length);
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"Invalid content length: %d\"}", command_id, content_length);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
 
-    // Send download start status
-    if (g_mqtt_client && g_network_handle) {
-        char status_msg[128];
-        snprintf(status_msg, sizeof(status_msg), "Downloading firmware (%d bytes)...", content_length);
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, status_msg, 0, 0, 0);
-    }
+    snprintf(status_msg, sizeof(status_msg), "{\"id\":%d,\"status\":\"downloading\",\"url\":\"%s\",\"content_length\":%d}", command_id, url, content_length);
+    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, status_msg);
 
     // Get the next update partition
     ota_partition = esp_ota_get_next_update_partition(NULL);
     if (ota_partition == NULL) {
         ESP_LOGE(TAG, "No OTA partition found");
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"No OTA partition found\"}", command_id);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
@@ -1282,6 +1381,11 @@ static esp_err_t perform_mqtt_ota(const char *url)
     err = esp_ota_begin(ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"%s\"}", command_id, esp_err_to_name(err));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return err;
@@ -1291,6 +1395,12 @@ static esp_err_t perform_mqtt_ota(const char *url)
     if (upgrade_data_buf == NULL) {
         ESP_LOGE(TAG, "Failed to allocate upgrade data buffer");
         esp_ota_abort(ota_handle);
+        free(upgrade_data_buf);
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"%s\"}", command_id, esp_err_to_name(ESP_ERR_NO_MEM));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
@@ -1301,32 +1411,30 @@ static esp_err_t perform_mqtt_ota(const char *url)
     int chunk_count = 0;
     
     ESP_LOGI(TAG, "Starting OTA download from: %s", url);
-    if (g_mqtt_client && g_network_handle) {
-        char start_msg[256];
-        snprintf(start_msg, sizeof(start_msg), "Starting OTA download: %d bytes from %s", content_length, url);
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, start_msg, 0, 0, 0);
-    }
-    
+
+    char start_msg[256];
+    snprintf(start_msg, sizeof(start_msg), "{\"id\":%d,\"status\":\"downloading\",\"url\":\"%s\",\"content_length\":%d}", command_id, url, content_length);
+    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, start_msg);
+
     while (true) {
         int data_read = esp_http_client_read(client, upgrade_data_buf, 1024);
         if (data_read < 0) {
             ESP_LOGE(TAG, "OTA data read error after %d bytes", binary_file_length);
-            if (g_mqtt_client && g_network_handle) {
-                char error_msg[128];
-                snprintf(error_msg, sizeof(error_msg), "OTA download failed after %d bytes", binary_file_length);
-                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-            }
+
+            char error_msg[128];
+            snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"OTA data read error after %d bytes\"}", command_id, binary_file_length);
+            safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
             break;
         } else if (data_read > 0) {
             err = esp_ota_write(ota_handle, (const void *)upgrade_data_buf, data_read);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_write failed after %d bytes: %s", binary_file_length, esp_err_to_name(err));
-                if (g_mqtt_client && g_network_handle) {
-                    char error_msg[128];
-                    snprintf(error_msg, sizeof(error_msg), "OTA write failed after %d bytes: %s", 
-                            binary_file_length, esp_err_to_name(err));
-                    esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-                }
+                
+                char error_msg[128];
+                snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"OTA write failed after %d bytes: %s\"}", command_id, binary_file_length, esp_err_to_name(err));
+                safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
                 break;
             }
             binary_file_length += data_read;
@@ -1336,31 +1444,29 @@ static esp_err_t perform_mqtt_ota(const char *url)
             int progress = (binary_file_length * 100) / content_length;
             if (progress >= last_progress_report + 5) {
                 last_progress_report = progress;
-                if (g_mqtt_client && g_network_handle) {
-                    char progress_msg[128];
-                    snprintf(progress_msg, sizeof(progress_msg), "OTA Progress: %d%% (%d/%d bytes)", 
-                            progress, binary_file_length, content_length);
-                    esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, progress_msg, 0, 0, 0);
-                }
+                
+                char progress_msg[128];
+                snprintf(progress_msg, sizeof(progress_msg), "{\"id\":%d,\"status\":\"progress\",\"message\":\"OTA Progress: %d%% (%d chunks received)\"}", command_id, progress, chunk_count);
+                safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, progress_msg);
+
                 ESP_LOGI(TAG, "OTA Progress: %d%% (%d chunks received)", progress, chunk_count);
                 
                 // Small delay to allow other tasks to run and MQTT messages to be sent
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             
-            // Yield every 32KB to allow other tasks (especially MQTT logging) to run
-            if ((binary_file_length % (32 * 1024)) == 0) {
-                ESP_LOGD(TAG, "OTA: Downloaded %d KB, yielding to other tasks...", binary_file_length / 1024);
+            // Yield every 256B to allow other tasks (especially MQTT logging) to run
+            if ((binary_file_length % 256) == 0) {
+                ESP_LOGD(TAG, "OTA: Downloaded %d bytes, yielding to other tasks...", binary_file_length);
                 vTaskDelay(pdMS_TO_TICKS(5));
             }
         } else if (data_read == 0) {
             ESP_LOGI(TAG, "OTA download completed - received %d bytes in %d chunks", binary_file_length, chunk_count);
-            if (g_mqtt_client && g_network_handle) {
-                char complete_msg[128];
-                snprintf(complete_msg, sizeof(complete_msg), "OTA download completed: %d bytes in %d chunks", 
-                        binary_file_length, chunk_count);
-                esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, complete_msg, 0, 0, 0);
-            }
+
+            char complete_msg[256];
+            snprintf(complete_msg, sizeof(complete_msg), "{\"id\":%d,\"status\":\"completed\",\"message\":\"OTA download completed: %d bytes in %d chunks\"}", command_id, binary_file_length, chunk_count);
+            safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, complete_msg);
+
             break;
         }
     }
@@ -1371,47 +1477,45 @@ static esp_err_t perform_mqtt_ota(const char *url)
 
     if (binary_file_length != content_length) {
         ESP_LOGE(TAG, "Incomplete download: %d/%d bytes", binary_file_length, content_length);
-        esp_ota_abort(ota_handle);
-        if (g_mqtt_client && g_network_handle) {
-            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, "OTA download incomplete", 0, 0, 0);
-        }
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"OTA download incomplete: %d/%d bytes\"}", command_id, binary_file_length, content_length);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         return ESP_FAIL;
     }
 
     err = esp_ota_end(ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
-        if (g_mqtt_client && g_network_handle) {
-            char error_msg[128];
-            snprintf(error_msg, sizeof(error_msg), "OTA finalization failed: %s", esp_err_to_name(err));
-            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-        }
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"OTA finalization failed: %s\"}", command_id, esp_err_to_name(err));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         return err;
     }
 
     err = esp_ota_set_boot_partition(ota_partition);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        if (g_mqtt_client && g_network_handle) {
-            char error_msg[128];
-            snprintf(error_msg, sizeof(error_msg), "OTA set boot partition failed: %s", esp_err_to_name(err));
-            esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_error, error_msg, 0, 0, 0);
-        }
+
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "{\"id\":%d,\"status\":\"error\",\"message\":\"OTA set boot partition failed: %s\"}", command_id, esp_err_to_name(err));
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, error_msg);
+
         return err;
     }
 
     ESP_LOGI(TAG, "OTA update successful, initiating graceful restart...");
-    if (g_mqtt_client && g_network_handle) {
-        char final_msg[256];
-        snprintf(final_msg, sizeof(final_msg), 
-                "OTA update completed successfully! Downloaded %d bytes, flashed to %s partition, restarting gracefully...", 
-                binary_file_length, ota_partition->label);
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, final_msg, 0, 0, 0);
-        
-        // Give time for the final message to be sent
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    
+
+    char final_msg[256];
+    snprintf(final_msg, sizeof(final_msg), "{\"id\":%d,\"status\":\"completed\",\"message\":\"OTA update completed successfully! Downloaded %d bytes, flashed to %s partition, restarting gracefully...\"}", command_id, binary_file_length, ota_partition->label);
+    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, final_msg);
+
+    // Give time for the final message to be sent
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     // Schedule deferred restart to avoid MQTT task deadlock
     esp_err_t defer_err = network_schedule_deferred_restart("OTA update completed");
     if (defer_err != ESP_OK) {
@@ -1432,13 +1536,6 @@ esp_err_t network_graceful_shutdown(network_handle_t *handle) {
     ESP_LOGI(TAG, "Starting graceful network shutdown...");
     TickType_t shutdown_start = xTaskGetTickCount();
     const TickType_t max_shutdown_time = pdMS_TO_TICKS(GRACEFUL_SHUTDOWN_TIMEOUT_MS);
-
-    // Send final status message if MQTT is available
-    if (g_mqtt_client && handle->mqtt_logging_enabled && g_network_handle) {
-        esp_mqtt_client_publish(g_mqtt_client, g_network_handle->mqtt_topic_status, "Network shutting down gracefully...", 0, 0, 0);
-        // Allow time for the message to be sent
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
 
     // Stop log forwarding first to prevent new log messages during shutdown
     ESP_LOGI(TAG, "Stopping log forwarding...");
@@ -1546,7 +1643,7 @@ esp_err_t network_start_measurement_publishing(network_handle_t *handle) {
     
     handle->measurement_publishing_enabled = true;
     
-    BaseType_t task_ret = xTaskCreate(measurement_publishing_task, "measurement_pub", 
+    BaseType_t task_ret = xTaskCreate(measurement_publishing_task, MEASUREMENT_TASK_NAME, 
                                      MEASUREMENT_TASK_STACK_SIZE, handle, 
                                      MEASUREMENT_TASK_PRIORITY, &g_measurement_task);
     if (task_ret != pdPASS) {
@@ -1701,7 +1798,7 @@ esp_err_t network_flush_log_buffer(network_handle_t *handle) {
             
             char *json_string = cJSON_Print(json);
             if (json_string) {
-                esp_mqtt_client_publish(g_mqtt_client, buffer->topics[index], json_string, 0, 1, 0);
+                safe_publish_mqtt(buffer->topics[index], json_string, QOS_1, 0);
                 free(json_string);
             }
             cJSON_Delete(json);
@@ -1804,7 +1901,7 @@ esp_err_t network_publish_firmware_info(network_handle_t *handle) {
     
     char *json_string = cJSON_Print(json);
     if (json_string) {
-        esp_mqtt_client_publish(g_mqtt_client, handle->mqtt_topic_firmware, json_string, 0, 1, 0);
+        safe_publish_mqtt(handle->mqtt_topic_firmware, json_string, QOS_1, 0);
         ESP_LOGI(TAG, "Firmware info published: version %s, OTA state %s", 
                  app_desc->version, ota_state_to_string(ota_state));
         free(json_string);
@@ -1832,4 +1929,44 @@ esp_err_t network_get_formatted_mac_address(char *mac_str, size_t mac_str_size) 
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     
     return ESP_OK;
+}
+
+esp_err_t safe_publish_mqtt(const char *topic, const char *message, int qos, int retain) {
+    if (!topic || !message) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_mqtt_client) {
+        esp_err_t ret = esp_mqtt_client_publish(g_mqtt_client, topic, message, 0, qos, retain);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to publish MQTT message: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t safe_publish_mqtt_default(const char *topic, const char *message) {
+    if (!topic || !message) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_mqtt_client) {
+        esp_err_t ret = esp_mqtt_client_publish(g_mqtt_client, topic, message, 0, QOS_0, 0);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to publish MQTT message: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
+    return ESP_OK;
+}
+
+const char* cmd_type_to_name(mqtt_command_t cmd_type) {
+    switch (cmd_type) {
+        case MQTT_COMMAND_RESTART: return "restart";
+        case MQTT_COMMAND_OTA: return "ota";
+        default: return "unknown_mqtt_command_type";
+    }
 }

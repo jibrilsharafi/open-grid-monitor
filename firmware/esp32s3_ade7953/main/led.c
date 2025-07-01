@@ -308,6 +308,11 @@ led_error_t led_set_status(led_handle_t *handle, led_status_t status) {
             led_color_t blue_color = LED_COLOR_BLUE;
             return led_set_pattern(handle, blue_color, LED_PATTERN_PULSE_SLOW);
         }
+
+        case LED_STATUS_WORKING: {
+            led_color_t green_color = LED_COLOR_GREEN;
+            return led_set_pattern(handle, green_color, LED_PATTERN_BLINK_SLOW);
+        }
         
         case LED_STATUS_READY: {
             led_color_t green_color = LED_COLOR_GREEN;

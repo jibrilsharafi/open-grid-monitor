@@ -39,8 +39,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize LED: %d", led_ret);
     } else {
         ESP_LOGI(TAG, "LED initialized successfully");
-        // Show startup sequence
-        led_show_startup_sequence(&led_handle);
         // Set status to initializing
         led_set_status(&led_handle, LED_STATUS_INITIALIZING);
     }
@@ -157,12 +155,13 @@ void app_main(void)
     ade7953_set_measurement_queue(&ade7953_handle, network_get_measurement_queue(&network_handle));
     
     // Start LED pattern task for dynamic patterns
-    led_set_status(&led_handle, LED_STATUS_READY);
+    led_set_status(&led_handle, LED_STATUS_WORKING);
     
     // Main loop - process readings and publish via MQTT
     uint32_t reading_count = 0;
     bool last_network_connected = false;
     
+    uint32_t loop_count = 0;
     while (true) {        
         bool network_connected = network_is_connected(&network_handle);
         
@@ -176,7 +175,14 @@ void app_main(void)
         
         last_network_connected = network_connected;
         reading_count++;
-        
+
+        loop_count++;
+        if (loop_count % 10 == 0) {
+            float frequency = ade7953_get_latest_frequency(&ade7953_handle);
+            float voltage = ade7953_get_latest_voltage(&ade7953_handle);
+            ESP_LOGI(TAG, "Frequency: %.3f Hz | Voltage: %.1f V", loop_count, frequency, voltage);
+        }
+
         // Wait before next reading (1 second for status monitoring)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

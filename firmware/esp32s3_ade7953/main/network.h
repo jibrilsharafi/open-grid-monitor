@@ -49,33 +49,41 @@
 #define GRACEFUL_SHUTDOWN_TIMEOUT_MS  10000  // Maximum time to wait for graceful shutdown
 
 // MQTT logging configuration
-// #define MQTT_BROKER_URI         "mqtt://192.168.2.41"
 #define MQTT_BROKER_URI         "mqtt://192.168.2.78"
 #define MQTT_PORT               1883
 // MQTT Authentication - set to default values to disable, or change to your credentials
 #define MQTT_KEEPALIVE          60
+#define MQTT_TASK_NAME          "mqtt_task"
 #define MQTT_TASK_STACK_SIZE    (32 * 1024)  // Increased for log processing
 #define MQTT_TASK_PRIORITY      3
 #define MQTT_QUEUE_SIZE         100
 #define MQTT_MSG_MAX_SIZE       256
 
 // MQTT Topics
+#define MQTT_TOPIC_LEN          64
 #define MQTT_TOPIC_BASE         "open_grid_monitor"
 #define MQTT_TOPIC_LOGS         "logs"
 #define MQTT_TOPIC_STATUS       "status" 
-#define MQTT_TOPIC_MEASUREMENT  "measurement"
 #define MQTT_TOPIC_SYSTEM       "system"
-#define MQTT_TOPIC_ERROR        "error"
+#define MQTT_TOPIC_MEASUREMENT  "measurement"
 #define MQTT_TOPIC_DEBUG        "debug"
-#define MQTT_TOPIC_COMMAND      "command"
-#define MQTT_TOPIC_HEADER       "header"
-#define MQTT_TOPIC_CHUNK        "chunk"
-#define MQTT_TOPIC_COMPLETE     "complete"
+#define MQTT_TOPIC_COMMANDS     "commands"
+#define MQTT_TOPIC_RESPONSES    "responses"
 #define MQTT_TOPIC_FIRMWARE     "firmware"
 
 // MQTT Commands
-#define MQTT_COMMAND_RESTART    "restart"
-#define MQTT_COMMAND_OTA        "ota"
+#define MQTT_TOPIC_COMMAND_RESTART "restart"
+#define MQTT_TOPIC_COMMAND_OTA     "ota"
+#define MQTT_COMMAND_PAYLOAD_LEN   256
+#define MQTT_COMMAND_DEFAULT_ID    -1
+
+// MQTT other constants
+#define MQTT_STATUS_INTERVAL    10000
+
+// MQTT definitions
+#define QOS_0                   0
+#define QOS_1                   1
+#define QOS_2                   2
 
 // MQTT OTA command format: {"url": "http://ip:port/firmware.bin"}
 #define MQTT_OTA_URL_MAX_LEN    256
@@ -96,6 +104,7 @@
 
 // Measurement queue configuration
 #define MEASUREMENT_QUEUE_SIZE  100
+#define MEASUREMENT_TASK_NAME   "measurement_pub_task"
 #define MEASUREMENT_TASK_STACK_SIZE (8 * 1024)
 #define MEASUREMENT_TASK_PRIORITY   5
 
@@ -140,18 +149,24 @@ typedef struct {
     char ip_address[16];
     char mac_address[13];  // 12 chars for MAC + null terminator (lowercase, no colons)
     char mqtt_client_id[32];
-    char mqtt_topic_logs[64];
-    char mqtt_topic_status[64];
-    char mqtt_topic_measurement[64];
-    char mqtt_topic_system[64];
-    char mqtt_topic_error[64];
-    char mqtt_topic_debug[64];
-    char mqtt_topic_command[64];
-    char mqtt_topic_firmware[64];
+    char mqtt_topic_logs[MQTT_TOPIC_LEN];
+    char mqtt_topic_status[MQTT_TOPIC_LEN];
+    char mqtt_topic_measurement[MQTT_TOPIC_LEN];
+    char mqtt_topic_system[MQTT_TOPIC_LEN];
+    char mqtt_topic_commands_restart[MQTT_TOPIC_LEN];
+    char mqtt_topic_commands_ota[MQTT_TOPIC_LEN];
+    char mqtt_topic_responses_restart[MQTT_TOPIC_LEN];
+    char mqtt_topic_responses_ota[MQTT_TOPIC_LEN];
+    char mqtt_topic_firmware[MQTT_TOPIC_LEN];
     QueueHandle_t log_queue;
     QueueHandle_t measurement_queue;
     log_buffer_t *log_buffer;
 } network_handle_t;
+
+typedef enum {
+    MQTT_COMMAND_RESTART,
+    MQTT_COMMAND_OTA
+} mqtt_command_t;
 
 // Function prototypes
 esp_err_t network_init(network_handle_t *handle);

@@ -46,7 +46,8 @@
 // LED status patterns
 typedef enum {
     LED_STATUS_OFF = 0,
-    LED_STATUS_INITIALIZING,    // Slow blue pulse
+    LED_STATUS_INITIALIZING,   // Slow blue pulse
+    LED_STATUS_WORKING,        // Slow green blink
     LED_STATUS_READY,          // Solid green
     LED_STATUS_READING,        // Fast green blink
     LED_STATUS_WARNING,        // Slow yellow blink
