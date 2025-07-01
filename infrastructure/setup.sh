@@ -4,20 +4,22 @@
 # This script initializes the MQTT password file, starts services, and configures InfluxDB token
 # 
 # This script generates the datasource configuration dynamically and uses static dashboard files:
-# - Generates grafana-provisioning/datasources/datasource.yml with actual credentials
-# - Uses static dashboard configurations from grafana-provisioning/dashboards/
+# - Generates grafana/provisioning/datasources/datasource.yml with actual credentials
+# - Uses static dashboard configurations from grafana/provisioning/dashboards/
 # - Creates Telegraf runtime configuration with actual MQTT/InfluxDB credentials
 #
 # This script is idempotent - it can be run multiple times safely and will only make
 # necessary changes, skipping steps that are already completed correctly.
 #
 # Usage:
-#   ./setup.sh          - Normal setup (idempotent)
-#   ./setup.sh --clean   - Clean all data and start fresh
-#   ./setup.sh --reset   - Same as --clean
+#   ./setup.sh             - Normal setup (idempotent)
+#   ./setup.sh --clean     - Clean all data and start fresh
+#   ./setup.sh --reset     - Same as --clean
+#   ./setup.sh --restart-all - Restart all services to reload configs
 
 # Check for clean/reset flag
 CLEAN_INSTALL=false
+RESTART_ALL=false
 if [[ "$1" == "--clean" ]] || [[ "$1" == "--reset" ]]; then
     CLEAN_INSTALL=true
     echo "🧹 CLEAN INSTALL MODE - This will delete ALL existing data!"
@@ -34,6 +36,10 @@ if [[ "$1" == "--clean" ]] || [[ "$1" == "--reset" ]]; then
         echo "Aborted."
         exit 1
     fi
+    echo ""
+elif [[ "$1" == "--restart-all" ]]; then
+    RESTART_ALL=true
+    echo "🔄 RESTART ALL MODE - This will restart all services to reload configurations"
     echo ""
 fi
 
@@ -72,7 +78,7 @@ if [ "$CLEAN_INSTALL" = true ]; then
     # Remove generated configuration files
     echo "  - Removing generated configurations..."
     rm -f telegraf/telegraf-open-grid-monitor-runtime.conf 2>/dev/null || true
-    rm -f grafana-provisioning/datasources/datasource.yml 2>/dev/null || true
+    rm -f grafana/provisioning/datasources/datasource.yml 2>/dev/null || true
     rm -f mosquitto/config/passwd 2>/dev/null || true
     
     # Reset InfluxDB token in .env file
@@ -123,20 +129,20 @@ mkdir -p influxdb
 mkdir -p grafana
 mkdir -p telegraf
 
-# Ensure grafana-provisioning directories exist
-mkdir -p grafana-provisioning/datasources
-mkdir -p grafana-provisioning/dashboards
+# Ensure grafana/provisioning directories exist
+mkdir -p grafana/provisioning/datasources
+mkdir -p grafana/provisioning/dashboards
 
 # Verify dashboard configuration files exist
-if [ ! -f "grafana-provisioning/dashboards/dashboard.yml" ]; then
+if [ ! -f "grafana/provisioning/dashboards/dashboard.yml" ]; then
     echo "❌ Error: Dashboard configuration not found!"
-    echo "Expected to find: grafana-provisioning/dashboards/dashboard.yml"
+    echo "Expected to find: grafana/provisioning/dashboards/dashboard.yml"
     exit 1
 fi
 
-if [ ! -f "grafana-provisioning/dashboards/open-grid-monitor-dashboard.json" ]; then
+if [ ! -f "grafana/provisioning/dashboards/open-grid-monitor-dashboard.json" ]; then
     echo "❌ Error: Dashboard JSON not found!"
-    echo "Expected to find: grafana-provisioning/dashboards/open-grid-monitor-dashboard.json"
+    echo "Expected to find: grafana/provisioning/dashboards/open-grid-monitor-dashboard.json"
     exit 1
 fi
 
@@ -161,6 +167,10 @@ if [ ! -f mosquitto/config/passwd ] || ! echo "${MQTT_USERNAME}:${MQTT_PASSWORD}
     # Move the hashed password file to the correct location
     mv mosquitto/config/passwd_temp mosquitto/config/passwd
     echo "✅ MQTT credentials updated"
+    
+    # Restart Mosquitto to reload credentials and ACL
+    echo "🔄 Restarting Mosquitto to reload configuration..."
+    docker-compose restart mosquitto
 else
     echo "✅ MQTT credentials already up to date"
 fi
@@ -306,7 +316,7 @@ docker-compose restart telegraf-open-grid-monitor
 echo "📊 Generating Grafana datasource configuration..."
 
 # Create datasource.yml with actual values
-cat > grafana-provisioning/datasources/datasource.yml << EOF
+cat > grafana/provisioning/datasources/datasource.yml << EOF
 apiVersion: 1
 
 datasources:
@@ -328,6 +338,12 @@ echo "✅ Grafana datasource configuration generated"
 # Restart Grafana to pick up new configuration
 echo "🔄 Restarting Grafana with new configuration..."
 docker-compose restart grafana
+
+# Restart all services if requested
+if [ "$RESTART_ALL" = true ]; then
+    echo "🔄 Restarting all services to reload configurations..."
+    docker-compose restart
+fi
 
 echo ""
 echo "🎉 Setup complete!"
@@ -362,9 +378,10 @@ echo "  3. Visit Grafana to see your configured dashboards"
 echo "  4. Create additional dashboards as needed for your grid monitoring"
 echo ""
 echo "💡 Setup Script Usage:"
-echo "  ./setup.sh         - Normal setup (idempotent)"
-echo "  ./setup.sh --clean  - Clean all data and start fresh"
-echo "  ./setup.sh --reset  - Same as --clean"
+echo "  ./setup.sh             - Normal setup (idempotent)"
+echo "  ./setup.sh --clean     - Clean all data and start fresh"
+echo "  ./setup.sh --reset     - Same as --clean"
+echo "  ./setup.sh --restart-all - Restart all services to reload configs"
 echo ""
 echo "🔍 Verifying services..."
 

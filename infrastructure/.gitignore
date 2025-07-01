@@ -3,13 +3,14 @@
 
 # Runtime configuration files
 telegraf/telegraf-*-runtime.conf
-grafana-provisioning/datasources/datasource.yml
 
 # Data directories
 mosquitto/data/
 mosquitto/log/
 influxdb/
-grafana/
+grafana/*
+!grafana/provisioning/
+grafana/provisioning/datasources
 
 # Generated password files
 mosquitto/config/passwd

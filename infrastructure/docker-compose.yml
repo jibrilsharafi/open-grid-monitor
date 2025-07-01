@@ -10,6 +10,8 @@ services:
       - ./mosquitto/config:/mosquitto/config
       - ./mosquitto/data:/mosquitto/data
       - ./mosquitto/log:/mosquitto/log
+    networks:
+      - open-grid-monitor
 
   influxdb:
     image: influxdb:2.7.12
@@ -25,6 +27,8 @@ services:
       - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_ADMIN_PASSWORD}
       - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG}
       - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET}
+    networks:
+      - open-grid-monitor
 
   telegraf-open-grid-monitor:
     image: telegraf:latest
@@ -35,6 +39,8 @@ services:
     depends_on:
       - influxdb
       - mosquitto
+    networks:
+      - open-grid-monitor
 
   grafana:
     image: grafana/grafana:latest
@@ -44,9 +50,15 @@ services:
       - "3000:3000"
     volumes:
       - ./grafana:/var/lib/grafana
-      - ./grafana-provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
     depends_on:
       - influxdb
+    networks:
+      - open-grid-monitor
+
+networks:
+  open-grid-monitor:
+    driver: bridge
+    name: open-grid-monitor

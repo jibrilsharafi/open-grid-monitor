@@ -1,14 +1,9 @@
 # Access Control List for Open Grid Monitor
-# Format: topic [read|write|readwrite] <topic>
+# Format: [user|pattern] <username> topic [read|write|readwrite] <topic>
 
-# Allow open grid monitor user to read/write to all open grid monitor topics
+# Allow open grid monitor user full access to all monitoring topics
 user open_grid_monitor
-topic readwrite open_grid_monitor/+/measurement
-topic readwrite open_grid_monitor/+/status
-topic readwrite open_grid_monitor/+/logs
+topic readwrite open_grid_monitor/#
 
-# Allow device-specific topics (where %c is the client ID)
-pattern readwrite open_grid_monitor/%c/+
-
-# Optional: Allow read-only access for monitoring tools
-topic read open_grid_monitor/+/+
+# Allow devices to publish to their own topics using client ID
+pattern write open_grid_monitor/%c/#
