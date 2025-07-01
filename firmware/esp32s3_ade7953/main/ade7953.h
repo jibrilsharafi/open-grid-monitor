@@ -13,8 +13,6 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-#include "struct.h"
-
 // Pin definitions
 #define ADE7953_SS_PIN          48
 #define ADE7953_SCK_PIN         36
@@ -70,6 +68,12 @@
 // Timing
 #define ADE7953_RESET_DURATION_MS       200
 #define ADE7953_SAMPLE_INTERVAL_MS      20  // 50Hz grid = 20ms per cycle
+
+typedef struct {
+    int64_t timestamp_us;
+    float frequency;
+    float voltage;
+} measurement_t;
 
 // Error codes
 typedef enum {

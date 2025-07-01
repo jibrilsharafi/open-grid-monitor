@@ -35,7 +35,6 @@
 #include "ade7953.h"
 #include "led.h"
 #include "secrets.h"
-#include "struct.h"
 
 // WiFi configuration
 #define WIFI_MAXIMUM_RETRY      5
