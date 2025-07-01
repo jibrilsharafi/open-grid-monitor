@@ -1,11 +1,12 @@
 #include "network.h"
 #include "esp_mac.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "network";
 
 // Global variables
 static network_handle_t *g_network_handle = NULL;
-static httpd_handle_t g_ota_server = NULL;
 static httpd_handle_t g_web_server = NULL;
 static TaskHandle_t g_mqtt_log_task = NULL;
 static TaskHandle_t g_measurement_task = NULL;
@@ -109,11 +110,6 @@ static int custom_log_writer(const char *fmt, va_list args)
                     strcpy(log_msg.topic, topic);
                 }
                 gettimeofday(&log_msg.timestamp, NULL);
-
-                // Strip final \n if present
-                if (temp_buffer[total_len - 1] == '\n') {
-                    temp_buffer[total_len - 1] = '\0';
-                }
 
                 // Use non-blocking send to avoid blocking in interrupt context
                 if (xQueueSend(g_log_queue, &log_msg, 0) != pdTRUE) {
@@ -313,6 +309,16 @@ static esp_err_t web_index_handler(httpd_req_t *req) {
         "    })"
         "    .catch(error => console.error('Error:', error));"
         "}"
+        "function loadConfig() {"
+        "  fetch('/api/config')"
+        "    .then(response => response.json())"
+        "    .then(data => {"
+        "      document.getElementById('mqtt-broker').value = data.mqtt_broker || '';"
+        "      document.getElementById('mqtt-port').value = data.mqtt_port || 1883;"
+        "      document.getElementById('mqtt-username').value = data.mqtt_username || '';"
+        "    })"
+        "    .catch(error => console.error('Error loading config:', error));"
+        "}"
         "function saveConfig() {"
         "  const config = {"
         "    mqtt_broker: document.getElementById('mqtt-broker').value,"
@@ -348,7 +354,7 @@ static esp_err_t web_index_handler(httpd_req_t *req) {
         "  }"
         "}"
         "setInterval(updateStatus, 1000);"
-        "window.onload = updateStatus;"
+        "window.onload = function() { updateStatus(); loadConfig(); };"
         "</script>"
         "</head>"
         "<body>"
@@ -377,15 +383,15 @@ static esp_err_t web_index_handler(httpd_req_t *req) {
         "<h2>MQTT Configuration</h2>"
         "<div class='form-group'>"
         "<label for='mqtt-broker'>MQTT Broker URI:</label>"
-        "<input type='text' id='mqtt-broker' placeholder='mqtt://192.168.1.100' value='mqtt://192.168.2.78'>"
+        "<input type='text' id='mqtt-broker' placeholder='mqtt://192.168.1.100'>"
         "</div>"
         "<div class='form-group'>"
         "<label for='mqtt-port'>MQTT Port:</label>"
-        "<input type='text' id='mqtt-port' placeholder='1883' value='1883'>"
+        "<input type='text' id='mqtt-port' placeholder='1883'>"
         "</div>"
         "<div class='form-group'>"
         "<label for='mqtt-username'>MQTT Username:</label>"
-        "<input type='text' id='mqtt-username' placeholder='Username' value='open_grid_monitor'>"
+        "<input type='text' id='mqtt-username' placeholder='Username'>"
         "</div>"
         "<div class='form-group'>"
         "<label for='mqtt-password'>MQTT Password:</label>"
@@ -484,28 +490,74 @@ static esp_err_t web_api_config_handler(httpd_req_t *req) {
         cJSON *mqtt_username = cJSON_GetObjectItem(json, "mqtt_username");
         cJSON *mqtt_password = cJSON_GetObjectItem(json, "mqtt_password");
         
-        // TODO: Update the configuration (requires NVS storage implementation)
-        ESP_LOGI(TAG, "Configuration update request received");
+        // Extract configuration values and update MQTT credentials
+        mqtt_credentials_t new_credentials;
+        esp_err_t err = network_get_mqtt_credentials(g_network_handle, &new_credentials);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get MQTT credentials: %s", esp_err_to_name(err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to get MQTT credentials");
+            return ESP_FAIL;
+        }
+        
+        bool credentials_updated = false;
+        
         if (mqtt_broker && cJSON_IsString(mqtt_broker)) {
-            ESP_LOGI(TAG, "MQTT Broker: %s", cJSON_GetStringValue(mqtt_broker));
+            const char *broker_uri = cJSON_GetStringValue(mqtt_broker);
+            if (broker_uri && strlen(broker_uri) > 0) {
+                strncpy(new_credentials.broker_uri, broker_uri, sizeof(new_credentials.broker_uri) - 1);
+                new_credentials.broker_uri[sizeof(new_credentials.broker_uri) - 1] = '\0';
+                credentials_updated = true;
+                ESP_LOGI(TAG, "MQTT Broker: %s", new_credentials.broker_uri);
+            }
         }
+        
         if (mqtt_port && cJSON_IsNumber(mqtt_port)) {
-            int mqtt_port_value = (int)cJSON_GetNumberValue(mqtt_port);
-            ESP_LOGI(TAG, "MQTT Port: %d", mqtt_port_value);
+            int port = (int)cJSON_GetNumberValue(mqtt_port);
+            if (port > 0 && port <= 65535) {
+                new_credentials.port = (uint16_t)port;
+                credentials_updated = true;
+                ESP_LOGI(TAG, "MQTT Port: %d", new_credentials.port);
+            }
         }
+        
         if (mqtt_username && cJSON_IsString(mqtt_username)) {
-            ESP_LOGI(TAG, "MQTT Username: %s", cJSON_GetStringValue(mqtt_username));
+            const char *username = cJSON_GetStringValue(mqtt_username);
+            if (username) {
+                strncpy(new_credentials.username, username, sizeof(new_credentials.username) - 1);
+                new_credentials.username[sizeof(new_credentials.username) - 1] = '\0';
+                new_credentials.use_auth = (strlen(new_credentials.username) > 0);
+                credentials_updated = true;
+                ESP_LOGI(TAG, "MQTT Username: %s", new_credentials.username);
+            }
         }
+        
         if (mqtt_password && cJSON_IsString(mqtt_password)) {
-            ESP_LOGI(TAG, "MQTT Password: [HIDDEN]");
+            const char *password = cJSON_GetStringValue(mqtt_password);
+            if (password) {
+                strncpy(new_credentials.password, password, sizeof(new_credentials.password) - 1);
+                new_credentials.password[sizeof(new_credentials.password) - 1] = '\0';
+                credentials_updated = true;
+                ESP_LOGI(TAG, "MQTT Password: [UPDATED]");
+            }
         }
         
         cJSON_Delete(json);
         
-        // Send response
+        // Save credentials if updated
         cJSON *response = cJSON_CreateObject();
-        cJSON_AddStringToObject(response, "status", "success");
-        cJSON_AddStringToObject(response, "message", "Configuration received (storage not yet implemented)");
+        if (credentials_updated) {
+            esp_err_t save_err = network_set_mqtt_credentials(g_network_handle, &new_credentials);
+            if (save_err == ESP_OK) {
+                cJSON_AddStringToObject(response, "status", "success");
+                cJSON_AddStringToObject(response, "message", "MQTT configuration saved successfully. Restart required for changes to take effect.");
+            } else {
+                cJSON_AddStringToObject(response, "status", "error");
+                cJSON_AddStringToObject(response, "message", "Failed to save MQTT configuration");
+            }
+        } else {
+            cJSON_AddStringToObject(response, "status", "success");
+            cJSON_AddStringToObject(response, "message", "No configuration changes detected");
+        }
         
         char *response_string = cJSON_Print(response);
         if (response_string) {
@@ -517,11 +569,23 @@ static esp_err_t web_api_config_handler(httpd_req_t *req) {
         
     } else {
         // Handle GET request - return current configuration
+        if (!g_network_handle) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Network handle not available");
+            return ESP_FAIL;
+        }
+        
         cJSON *config = cJSON_CreateObject();
-        cJSON_AddStringToObject(config, "mqtt_broker", MQTT_BROKER_URI);
-        cJSON_AddNumberToObject(config, "mqtt_port", MQTT_PORT);
-        cJSON_AddStringToObject(config, "mqtt_username", MQTT_USERNAME);
-        cJSON_AddStringToObject(config, "mqtt_password", ""); // Don't send actual password
+        mqtt_credentials_t *creds = malloc(sizeof(mqtt_credentials_t));
+        esp_err_t err = network_get_mqtt_credentials(g_network_handle, creds);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get MQTT credentials: %s", esp_err_to_name(err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to get MQTT credentials");
+            return ESP_FAIL;
+        }
+        cJSON_AddStringToObject(config, "mqtt_broker", creds->broker_uri);
+        cJSON_AddNumberToObject(config, "mqtt_port", creds->port);
+        cJSON_AddStringToObject(config, "mqtt_username", creds->username);
+        cJSON_AddStringToObject(config, "mqtt_password", "*****"); // Don't send actual password for security
         
         char *config_string = cJSON_Print(config);
         if (config_string) {
@@ -1018,6 +1082,17 @@ esp_err_t network_init(network_handle_t *handle, led_handle_t *led_handle, ade79
     ESP_LOGI(TAG, "MAC address (formatted): %s", handle->mac_address);
     ESP_LOGI(TAG, "MQTT client ID: %s", handle->mqtt_client_id);
     
+    // Load MQTT credentials
+    esp_err_t cred_ret = network_load_mqtt_credentials(&handle->mqtt_credentials);
+    if (cred_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to load MQTT credentials, using defaults");
+    } else {
+        ESP_LOGI(TAG, "MQTT credentials loaded: broker=%s, port=%d, auth=%s", 
+                 handle->mqtt_credentials.broker_uri, 
+                 handle->mqtt_credentials.port,
+                 handle->mqtt_credentials.use_auth ? "enabled" : "disabled");
+    }
+    
     // Don't setup log forwarding here to prevent stack overflow during WiFi init
     // Log forwarding will be set up when MQTT logging starts
     
@@ -1059,7 +1134,6 @@ esp_err_t network_deinit(network_handle_t *handle) {
     network_stop_measurement_publishing(handle);
     network_stop_mqtt_logging(handle);
     network_stop_web_server(handle);
-    network_stop_ota(handle);
     network_stop_wifi(handle);
     
     // Clean up rollback check task (if still running)
@@ -1178,53 +1252,6 @@ esp_err_t network_stop_wifi(network_handle_t *handle) {
     return ESP_OK;
 }
 
-// Start OTA server
-esp_err_t network_start_ota(network_handle_t *handle) {
-    if (!handle || handle->status != WIFI_STATUS_CONNECTED) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = OTA_SERVER_PORT;
-    config.max_uri_handlers = OTA_MAX_URI;
-    config.stack_size = OTA_STACK_SIZE;
-    
-    httpd_uri_t ota_uri = {
-        .uri = OTA_UPDATE_PATH,
-        .method = HTTP_POST,
-        .handler = ota_upload_handler,
-        .user_ctx = NULL
-    };
-    
-    if (httpd_start(&g_ota_server, &config) == ESP_OK) {
-        httpd_register_uri_handler(g_ota_server, &ota_uri);
-        handle->ota_enabled = true;
-        ESP_LOGI(TAG, "OTA server started on port %d", OTA_SERVER_PORT);
-        ESP_LOGI(TAG, "Upload firmware via: curl -X POST --data-binary @firmware.bin http://%s:%d%s", 
-                 handle->ip_address, OTA_SERVER_PORT, OTA_UPDATE_PATH);
-        return ESP_OK;
-    }
-    
-    ESP_LOGE(TAG, "Failed to start OTA server");
-    return ESP_FAIL;
-}
-
-// Stop OTA server
-esp_err_t network_stop_ota(network_handle_t *handle) {
-    if (!handle) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    if (g_ota_server) {
-        httpd_stop(g_ota_server);
-        g_ota_server = NULL;
-        handle->ota_enabled = false;
-        ESP_LOGI(TAG, "OTA server stopped");
-    }
-    
-    return ESP_OK;
-}
-
 // Start Web Server
 esp_err_t network_start_web_server(network_handle_t *handle) {
     if (!handle || handle->status != WIFI_STATUS_CONNECTED) {
@@ -1277,6 +1304,13 @@ esp_err_t network_start_web_server(network_handle_t *handle) {
         .user_ctx = NULL
     };
     
+    httpd_uri_t ota_uri = {
+        .uri = "/api/update",
+        .method = HTTP_POST,
+        .handler = ota_upload_handler,
+        .user_ctx = NULL
+    };
+    
     // Start the web server
     if (httpd_start(&g_web_server, &config) == ESP_OK) {
         // Register URI handlers
@@ -1285,6 +1319,7 @@ esp_err_t network_start_web_server(network_handle_t *handle) {
         httpd_register_uri_handler(g_web_server, &config_get_uri);
         httpd_register_uri_handler(g_web_server, &config_post_uri);
         httpd_register_uri_handler(g_web_server, &restart_uri);
+        httpd_register_uri_handler(g_web_server, &ota_uri);
         
         handle->web_server_enabled = true;
         ESP_LOGI(TAG, "Web server started on port %d", WEB_SERVER_PORT);
@@ -1327,20 +1362,20 @@ esp_err_t network_start_mqtt_logging(network_handle_t *handle) {
     
     // Configure MQTT client
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
-        .broker.address.port = MQTT_PORT,
+        .broker.address.uri = handle->mqtt_credentials.broker_uri,
+        .broker.address.port = handle->mqtt_credentials.port,
         .credentials.client_id = handle->mqtt_client_id,
         .session.keepalive = MQTT_KEEPALIVE,
     };
     
-    // Add authentication if username/password are provided
-    if (strcmp(MQTT_USERNAME, "your_mqtt_username") != 0 && strlen(MQTT_USERNAME) > 0) {
-        mqtt_cfg.credentials.username = MQTT_USERNAME;
-        ESP_LOGI(TAG, "MQTT authentication enabled for user: %s", MQTT_USERNAME);
-    }
-    
-    if (strcmp(MQTT_PASSWORD, "your_mqtt_password") != 0 && strlen(MQTT_PASSWORD) > 0) {
-        mqtt_cfg.credentials.authentication.password = MQTT_PASSWORD;
+    // Add authentication if enabled and credentials are provided
+    if (handle->mqtt_credentials.use_auth && strlen(handle->mqtt_credentials.username) > 0) {
+        mqtt_cfg.credentials.username = handle->mqtt_credentials.username;
+        ESP_LOGI(TAG, "MQTT authentication enabled for user: %s", handle->mqtt_credentials.username);
+        
+        if (strlen(handle->mqtt_credentials.password) > 0) {
+            mqtt_cfg.credentials.authentication.password = handle->mqtt_credentials.password;
+        }
     }
     
     g_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -1383,7 +1418,7 @@ esp_err_t network_start_mqtt_logging(network_handle_t *handle) {
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "MQTT logging started, publishing to %s", MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "MQTT logging started");
     return ESP_OK;
 }
 
@@ -1983,12 +2018,6 @@ esp_err_t network_graceful_shutdown(network_handle_t *handle) {
         return ESP_ERR_TIMEOUT;
     }
 
-    // Stop OTA server
-    if (handle->ota_enabled) {
-        ESP_LOGI(TAG, "Stopping OTA server...");
-        network_stop_ota(handle);
-    }
-
     // Disconnect WiFi gracefully
     if (handle->status == WIFI_STATUS_CONNECTED) {
         ESP_LOGI(TAG, "Disconnecting WiFi...");
@@ -2382,4 +2411,139 @@ const char* cmd_type_to_name(mqtt_command_t cmd_type) {
         case MQTT_COMMAND_OTA: return "ota";
         default: return "unknown_mqtt_command_type";
     }
+}
+
+// MQTT credentials management functions
+
+// Load MQTT credentials from NVS
+esp_err_t network_load_mqtt_credentials(mqtt_credentials_t *credentials) {
+    if (!credentials) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_MQTT_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "Failed to open NVS for reading MQTT credentials: %s", esp_err_to_name(err));
+
+        // Set default values
+        strncpy(credentials->broker_uri, MQTT_DEFAULT_BROKER_URI, sizeof(credentials->broker_uri) - 1);
+        credentials->broker_uri[sizeof(credentials->broker_uri) - 1] = '\0';
+        credentials->port = MQTT_DEFAULT_PORT;
+        strncpy(credentials->username, MQTT_DEFAULT_USERNAME, sizeof(credentials->username) - 1);
+        credentials->username[sizeof(credentials->username) - 1] = '\0';
+        strncpy(credentials->password, "password", sizeof(credentials->password) - 1);
+        credentials->password[sizeof(credentials->password) - 1] = '\0';
+        credentials->use_auth = (strlen(MQTT_DEFAULT_USERNAME) > 0 && strcmp(MQTT_DEFAULT_USERNAME, "your_mqtt_username") != 0);
+        return ESP_OK;
+    }
+    
+    size_t required_size = sizeof(credentials->broker_uri);
+    err = nvs_get_str(nvs_handle, "broker_uri", credentials->broker_uri, &required_size);
+    if (err != ESP_OK) {
+        strncpy(credentials->broker_uri, MQTT_DEFAULT_BROKER_URI, sizeof(credentials->broker_uri) - 1);
+        credentials->broker_uri[sizeof(credentials->broker_uri) - 1] = '\0';
+    }
+    
+    err = nvs_get_u16(nvs_handle, "port", &credentials->port);
+    if (err != ESP_OK) {
+        credentials->port = MQTT_DEFAULT_PORT;
+    }
+    
+    required_size = sizeof(credentials->username);
+    err = nvs_get_str(nvs_handle, "username", credentials->username, &required_size);
+    if (err != ESP_OK) {
+        strncpy(credentials->username, MQTT_DEFAULT_USERNAME, sizeof(credentials->username) - 1);
+        credentials->username[sizeof(credentials->username) - 1] = '\0';
+    }
+    
+    required_size = sizeof(credentials->password);
+    err = nvs_get_str(nvs_handle, "password", credentials->password, &required_size);
+    if (err != ESP_OK) {
+        strncpy(credentials->password, "password", sizeof(credentials->password) - 1);
+        credentials->password[sizeof(credentials->password) - 1] = '\0';
+    }
+    
+    uint8_t use_auth_u8;
+    err = nvs_get_u8(nvs_handle, "use_auth", &use_auth_u8);
+    if (err != ESP_OK) {
+        credentials->use_auth = (strlen(credentials->username) > 0 && strcmp(credentials->username, "your_mqtt_username") != 0);
+    } else {
+        credentials->use_auth = (use_auth_u8 != 0);
+    }
+    
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "MQTT credentials loaded from NVS");
+    return ESP_OK;
+}
+
+// Save MQTT credentials to NVS
+esp_err_t network_save_mqtt_credentials(const mqtt_credentials_t *credentials) {
+    if (!credentials) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_MQTT_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for writing MQTT credentials: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    err = nvs_set_str(nvs_handle, "broker_uri", credentials->broker_uri);
+    if (err != ESP_OK) goto cleanup;
+    
+    err = nvs_set_u16(nvs_handle, "port", credentials->port);
+    if (err != ESP_OK) goto cleanup;
+    
+    err = nvs_set_str(nvs_handle, "username", credentials->username);
+    if (err != ESP_OK) goto cleanup;
+    
+    err = nvs_set_str(nvs_handle, "password", credentials->password);
+    if (err != ESP_OK) goto cleanup;
+    
+    uint8_t use_auth_u8 = credentials->use_auth ? 1 : 0;
+    err = nvs_set_u8(nvs_handle, "use_auth", use_auth_u8);
+    if (err != ESP_OK) goto cleanup;
+    
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit MQTT credentials to NVS: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "MQTT credentials saved to NVS");
+    }
+    
+cleanup:
+    nvs_close(nvs_handle);
+    return err;
+}
+
+// Get MQTT credentials from network handle
+esp_err_t network_get_mqtt_credentials(network_handle_t *handle, mqtt_credentials_t *credentials) {
+    if (!handle || !credentials) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    memcpy(credentials, &handle->mqtt_credentials, sizeof(mqtt_credentials_t));
+    return ESP_OK;
+}
+
+// Set MQTT credentials in network handle and save to NVS
+esp_err_t network_set_mqtt_credentials(network_handle_t *handle, const mqtt_credentials_t *credentials) {
+    if (!handle || !credentials) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Update the handle's credentials
+    memcpy(&handle->mqtt_credentials, credentials, sizeof(mqtt_credentials_t));
+    
+    // Save to NVS
+    esp_err_t err = network_save_mqtt_credentials(credentials);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save MQTT credentials: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    ESP_LOGI(TAG, "MQTT credentials updated successfully");
+    return ESP_OK;
 }

@@ -43,11 +43,7 @@
 #define WIFI_FAIL_BIT           BIT1
 
 // OTA configuration
-#define OTA_SERVER_PORT         8080
-#define OTA_MAX_URI             1
-#define OTA_STACK_SIZE          (8 * 1024)
-#define OTA_UPDATE_PATH         "/update"
-#define OTA_VALIDATION_TIMEOUT  10000  // Time required to validate new firmware
+#define OTA_VALIDATION_TIMEOUT  15000  // Time required to validate new firmware
 
 // HTTP Web Server configuration
 #define WEB_SERVER_PORT         80
@@ -58,10 +54,14 @@
 #define GRACEFUL_SHUTDOWN_TIMEOUT_MS  10000  // Maximum time to wait for graceful shutdown
 
 // MQTT logging configuration
-#define MQTT_BROKER_URI         "mqtt://192.168.2.78"
-#define MQTT_PORT               1883
+#define MQTT_DEFAULT_BROKER_URI         "mqtt://192.168.1.1"
+#define MQTT_DEFAULT_PORT               1883
+#define MQTT_DEFAULT_USERNAME           "open_grid_monitor"
+#define NVS_MQTT_NAMESPACE              "mqtt_config"
+
 // MQTT Authentication - set to default values to disable, or change to your credentials
 #define MQTT_KEEPALIVE          60
+#define MQTT_CREDENTIALS_MAX_LEN 64
 #define MQTT_TASK_NAME          "mqtt_task"
 #define MQTT_TASK_STACK_SIZE    (32 * 1024)  // Increased for log processing
 #define MQTT_TASK_PRIORITY      3
@@ -146,6 +146,15 @@ typedef struct {
     bool overflow;
 } log_buffer_t;
 
+// MQTT credentials structure
+typedef struct {
+    char broker_uri[128];
+    uint16_t port;
+    char username[MQTT_CREDENTIALS_MAX_LEN];
+    char password[MQTT_CREDENTIALS_MAX_LEN];
+    bool use_auth;
+} mqtt_credentials_t;
+
 // Network handle structure
 typedef struct {
     EventGroupHandle_t wifi_event_group;
@@ -173,6 +182,7 @@ typedef struct {
     log_buffer_t *log_buffer;
     led_handle_t *led_handle;
     ade7953_handle_t *ade7953_handle;
+    mqtt_credentials_t mqtt_credentials;
 } network_handle_t;
 
 typedef enum {
@@ -185,8 +195,6 @@ esp_err_t network_init(network_handle_t *handle, led_handle_t *led_handle, ade79
 esp_err_t network_deinit(network_handle_t *handle);
 esp_err_t network_start_wifi(network_handle_t *handle);
 esp_err_t network_stop_wifi(network_handle_t *handle);
-esp_err_t network_start_ota(network_handle_t *handle);
-esp_err_t network_stop_ota(network_handle_t *handle);
 esp_err_t network_start_mqtt_logging(network_handle_t *handle);
 esp_err_t network_stop_mqtt_logging(network_handle_t *handle);
 
@@ -225,7 +233,6 @@ void network_schedule_rollback_check(void);
 esp_err_t network_graceful_shutdown_and_restart(network_handle_t *handle, const char *reason);
 esp_err_t network_graceful_shutdown(network_handle_t *handle);
 esp_err_t network_schedule_deferred_restart(const char *reason);
-esp_err_t network_schedule_deferred_shutdown(const char *reason);
 
 // Firmware functions
 esp_err_t network_publish_firmware_info(network_handle_t *handle);
@@ -241,3 +248,9 @@ esp_err_t network_deinit_log_buffer(network_handle_t *handle);
 
 // Get MAC address formatted for MQTT (lowercase, no colons)
 esp_err_t network_get_formatted_mac_address(char *mac_str, size_t mac_str_size);
+
+// MQTT credentials management functions
+esp_err_t network_load_mqtt_credentials(mqtt_credentials_t *credentials);
+esp_err_t network_save_mqtt_credentials(const mqtt_credentials_t *credentials);
+esp_err_t network_get_mqtt_credentials(network_handle_t *handle, mqtt_credentials_t *credentials);
+esp_err_t network_set_mqtt_credentials(network_handle_t *handle, const mqtt_credentials_t *credentials);

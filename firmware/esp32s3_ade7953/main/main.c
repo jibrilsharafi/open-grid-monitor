@@ -7,7 +7,6 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
-// #define ENABLE_OTA_UPDATES
 #define ENABLE_MQTT_LOGGING
 #define ENABLE_MEASUREMENT_PUBLISHING
 
@@ -102,16 +101,6 @@ void app_main(void)
             if (sntp_ret != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to synchronize time via SNTP");
             }
-            
-            // Start OTA server
-            #ifdef ENABLE_OTA_UPDATES
-            net_ret = network_start_ota(&network_handle);
-            if (net_ret == ESP_OK) {
-                ESP_LOGI(TAG, "OTA server started successfully");
-            } else {
-                ESP_LOGW(TAG, "Failed to start OTA server");
-            }
-            #endif
 
             // Start web server
             net_ret = network_start_web_server(&network_handle);
