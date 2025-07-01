@@ -64,12 +64,6 @@ void app_main(void)
             ESP_LOGW(TAG, "OTA rollback check failed");
         }
         
-        // Check for core dumps immediately (even without MQTT)
-        esp_err_t coredump_ret = network_check_and_publish_coredump(&network_handle);
-        if (coredump_ret != ESP_OK && coredump_ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "Core dump check failed: %s", esp_err_to_name(coredump_ret));
-        }
-        
         // Start WiFi
         net_ret = network_start_wifi(&network_handle);
         if (net_ret == ESP_OK) {

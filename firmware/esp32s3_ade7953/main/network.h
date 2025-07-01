@@ -3,7 +3,6 @@
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
-#include "esp_core_dump.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
@@ -69,7 +68,6 @@
 #define MQTT_TOPIC_ERROR        "error"
 #define MQTT_TOPIC_DEBUG        "debug"
 #define MQTT_TOPIC_COMMAND      "command"
-#define MQTT_TOPIC_COREDUMP     "coredump"
 #define MQTT_TOPIC_HEADER       "header"
 #define MQTT_TOPIC_CHUNK        "chunk"
 #define MQTT_TOPIC_COMPLETE     "complete"
@@ -78,7 +76,6 @@
 // MQTT Commands
 #define MQTT_COMMAND_RESTART    "restart"
 #define MQTT_COMMAND_OTA        "ota"
-#define MQTT_COMMAND_COREDUMP   "coredump"
 
 // MQTT OTA command format: {"url": "http://ip:port/firmware.bin"}
 #define MQTT_OTA_URL_MAX_LEN    256
@@ -150,7 +147,6 @@ typedef struct {
     char mqtt_topic_error[64];
     char mqtt_topic_debug[64];
     char mqtt_topic_command[64];
-    char mqtt_topic_coredump[64];
     char mqtt_topic_firmware[64];
     QueueHandle_t log_queue;
     QueueHandle_t measurement_queue;
@@ -203,9 +199,7 @@ esp_err_t network_graceful_shutdown(network_handle_t *handle);
 esp_err_t network_schedule_deferred_restart(const char *reason);
 esp_err_t network_schedule_deferred_shutdown(const char *reason);
 
-// Core dump and firmware functions
-esp_err_t network_check_and_publish_coredump(network_handle_t *handle);
-esp_err_t network_request_and_publish_coredump(network_handle_t *handle);
+// Firmware functions
 esp_err_t network_publish_firmware_info(network_handle_t *handle);
 
 // Log buffering functions for pre-MQTT logs
