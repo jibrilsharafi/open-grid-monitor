@@ -89,7 +89,7 @@
             "properties": [
               {
                 "id": "custom.lineWidth",
-                "value": 4
+                "value": 2
               }
             ]
           }
@@ -344,7 +344,7 @@
             "properties": [
               {
                 "id": "custom.lineWidth",
-                "value": 4
+                "value": 2
               }
             ]
           }
