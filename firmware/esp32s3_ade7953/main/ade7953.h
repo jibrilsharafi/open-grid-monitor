@@ -64,7 +64,7 @@
 
 // Task configuration
 #define ADE7953_TASK_STACK_SIZE (8 * 1024)
-#define ADE7953_TASK_PRIORITY   5
+#define ADE7953_TASK_PRIORITY   10
 #define ADE7953_TASK_NAME       "ade7953_task"
 
 // Timing

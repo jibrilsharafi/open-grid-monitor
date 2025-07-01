@@ -480,6 +480,7 @@ ade7953_error_t ade7953_stop_task(ade7953_handle_t *handle) {
 // Get latest frequency reading (non-blocking)
 float ade7953_get_latest_frequency(ade7953_handle_t *handle) {
     if (!handle) {
+        ESP_LOGW(TAG, "Invalid ADE7953 handle for frequency reading");
         return 0.0f;
     }
     return handle->grid_frequency;
@@ -488,6 +489,7 @@ float ade7953_get_latest_frequency(ade7953_handle_t *handle) {
 // Get latest voltage reading (non-blocking)
 float ade7953_get_latest_voltage(ade7953_handle_t *handle) {
     if (!handle) {
+        ESP_LOGW(TAG, "Invalid ADE7953 handle for voltage reading");
         return 0.0f;
     }
     return handle->voltage_rms;
@@ -496,6 +498,7 @@ float ade7953_get_latest_voltage(ade7953_handle_t *handle) {
 // Get timestamp of last reading
 uint32_t ade7953_get_last_reading_time(ade7953_handle_t *handle) {
     if (!handle) {
+        ESP_LOGW(TAG, "Invalid ADE7953 handle for last reading time");
         return 0;
     }
     return handle->last_reading_ms;

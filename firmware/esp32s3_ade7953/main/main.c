@@ -7,7 +7,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
-#define ENABLE_OTA_UPDATES
+// #define ENABLE_OTA_UPDATES
 #define ENABLE_MQTT_LOGGING
 #define ENABLE_MEASUREMENT_PUBLISHING
 
@@ -43,11 +43,40 @@ void app_main(void)
         led_set_status(&led_handle, LED_STATUS_INITIALIZING);
     }
     
+    
+    // Initialize ADE7953 handle
+    ade7953_handle_t ade7953_handle;
+    
+    // Initialize the ADE7953 driver
+    ade7953_error_t ret = ade7953_init(&ade7953_handle);
+    if (ret != ADE7953_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ADE7953: %d", ret);
+        if (led_ret == LED_OK) {
+            led_set_status(&led_handle, LED_STATUS_ERROR);
+        }
+        return;
+    }
+    
+    ESP_LOGI(TAG, "ADE7953 initialized successfully");
+    
+    // Start the background task for continuous readings
+    ret = ade7953_start_task(&ade7953_handle);
+    if (ret != ADE7953_OK) {
+        ESP_LOGE(TAG, "Failed to start ADE7953 task: %d", ret);
+        if (led_ret == LED_OK) {
+            led_set_status(&led_handle, LED_STATUS_ERROR);
+        }
+        ade7953_deinit(&ade7953_handle);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "ADE7953 background task started");
+    
     // Initialize network handle
     network_handle_t network_handle;
-    
+
     // Initialize network
-    esp_err_t net_ret = network_init(&network_handle);
+    esp_err_t net_ret = network_init(&network_handle, &led_handle, &ade7953_handle);
     if (net_ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize network: %s", esp_err_to_name(net_ret));
         if (led_ret == LED_OK) {
@@ -83,6 +112,14 @@ void app_main(void)
                 ESP_LOGW(TAG, "Failed to start OTA server");
             }
             #endif
+
+            // Start web server
+            net_ret = network_start_web_server(&network_handle);
+            if (net_ret == ESP_OK) {
+                ESP_LOGI(TAG, "Web server started successfully");
+            } else {
+                ESP_LOGW(TAG, "Failed to start web server");
+            }
             
             // Start MQTT logging
             #ifdef ENABLE_MQTT_LOGGING
@@ -122,34 +159,6 @@ void app_main(void)
             }
         }
     }
-    
-    // Initialize ADE7953 handle
-    ade7953_handle_t ade7953_handle;
-    
-    // Initialize the ADE7953 driver
-    ade7953_error_t ret = ade7953_init(&ade7953_handle);
-    if (ret != ADE7953_OK) {
-        ESP_LOGE(TAG, "Failed to initialize ADE7953: %d", ret);
-        if (led_ret == LED_OK) {
-            led_set_status(&led_handle, LED_STATUS_ERROR);
-        }
-        return;
-    }
-    
-    ESP_LOGI(TAG, "ADE7953 initialized successfully");
-    
-    // Start the background task for continuous readings
-    ret = ade7953_start_task(&ade7953_handle);
-    if (ret != ADE7953_OK) {
-        ESP_LOGE(TAG, "Failed to start ADE7953 task: %d", ret);
-        if (led_ret == LED_OK) {
-            led_set_status(&led_handle, LED_STATUS_ERROR);
-        }
-        ade7953_deinit(&ade7953_handle);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "ADE7953 background task started");
     
     // Set the measurement queue for automatic measurement publishing
     ade7953_set_measurement_queue(&ade7953_handle, network_get_measurement_queue(&network_handle));

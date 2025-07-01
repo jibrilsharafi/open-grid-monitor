@@ -293,6 +293,7 @@ led_error_t led_set_pattern(led_handle_t *handle, led_color_t color, led_pattern
 // Set LED status with predefined patterns
 led_error_t led_set_status(led_handle_t *handle, led_status_t status) {
     if (!handle || !handle->initialized) {
+        ESP_LOGW(TAG, "Invalid LED handle to set status");
         return LED_ERROR_INIT;
     }
     

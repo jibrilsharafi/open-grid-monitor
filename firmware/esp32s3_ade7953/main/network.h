@@ -32,6 +32,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "ade7953.h"
 #include "led.h"
 #include "secrets.h"
 #include "struct.h"
@@ -43,8 +44,15 @@
 
 // OTA configuration
 #define OTA_SERVER_PORT         8080
+#define OTA_MAX_URI             1
+#define OTA_STACK_SIZE          (8 * 1024)
 #define OTA_UPDATE_PATH         "/update"
 #define OTA_VALIDATION_TIMEOUT  10000  // Time required to validate new firmware
+
+// HTTP Web Server configuration
+#define WEB_SERVER_PORT         80
+#define WEB_SERVER_MAX_URI      10
+#define WEB_SERVER_STACK_SIZE   (8 * 1024)
 
 // Graceful shutdown configuration
 #define GRACEFUL_SHUTDOWN_TIMEOUT_MS  10000  // Maximum time to wait for graceful shutdown
@@ -107,7 +115,7 @@
 #define MEASUREMENT_QUEUE_SIZE  100
 #define MEASUREMENT_TASK_NAME   "measurement_pub_task"
 #define MEASUREMENT_TASK_STACK_SIZE (8 * 1024)
-#define MEASUREMENT_TASK_PRIORITY   5
+#define MEASUREMENT_TASK_PRIORITY   7
 
 // SNTP configuration
 #define SNTP_SERVER             "pool.ntp.org"
@@ -146,6 +154,7 @@ typedef struct {
     bool mqtt_logging_enabled;
     bool mqtt_commands_enabled;
     bool measurement_publishing_enabled;
+    bool web_server_enabled;
     int retry_count;
     char ip_address[16];
     char mac_address[13];  // 12 chars for MAC + null terminator (lowercase, no colons)
@@ -163,6 +172,7 @@ typedef struct {
     QueueHandle_t measurement_queue;
     log_buffer_t *log_buffer;
     led_handle_t *led_handle;
+    ade7953_handle_t *ade7953_handle;
 } network_handle_t;
 
 typedef enum {
@@ -171,7 +181,7 @@ typedef enum {
 } mqtt_command_t;
 
 // Function prototypes
-esp_err_t network_init(network_handle_t *handle);
+esp_err_t network_init(network_handle_t *handle, led_handle_t *led_handle, ade7953_handle_t *ade7953_handle);
 esp_err_t network_deinit(network_handle_t *handle);
 esp_err_t network_start_wifi(network_handle_t *handle);
 esp_err_t network_stop_wifi(network_handle_t *handle);
@@ -219,6 +229,10 @@ esp_err_t network_schedule_deferred_shutdown(const char *reason);
 
 // Firmware functions
 esp_err_t network_publish_firmware_info(network_handle_t *handle);
+
+// HTTP Web Server functions
+esp_err_t network_start_web_server(network_handle_t *handle);
+esp_err_t network_stop_web_server(network_handle_t *handle);
 
 // Log buffering functions for pre-MQTT logs
 esp_err_t network_init_log_buffer(network_handle_t *handle);

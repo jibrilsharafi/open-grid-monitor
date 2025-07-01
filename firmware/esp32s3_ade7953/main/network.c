@@ -6,6 +6,7 @@ static const char *TAG = "network";
 // Global variables
 static network_handle_t *g_network_handle = NULL;
 static httpd_handle_t g_ota_server = NULL;
+static httpd_handle_t g_web_server = NULL;
 static TaskHandle_t g_mqtt_log_task = NULL;
 static TaskHandle_t g_measurement_task = NULL;
 static esp_mqtt_client_handle_t g_mqtt_client = NULL;
@@ -20,6 +21,10 @@ static bool g_mqtt_connected = false;
 // Forward declarations
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static esp_err_t ota_upload_handler(httpd_req_t *req);
+static esp_err_t web_index_handler(httpd_req_t *req);
+static esp_err_t web_api_status_handler(httpd_req_t *req);
+static esp_err_t web_api_config_handler(httpd_req_t *req);
+static esp_err_t web_api_restart_handler(httpd_req_t *req);
 static void mqtt_logging_task(void *pvParameters);
 static void measurement_publishing_task(void *pvParameters);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
@@ -104,7 +109,12 @@ static int custom_log_writer(const char *fmt, va_list args)
                     strcpy(log_msg.topic, topic);
                 }
                 gettimeofday(&log_msg.timestamp, NULL);
-                
+
+                // Strip final \n if present
+                if (temp_buffer[total_len - 1] == '\n') {
+                    temp_buffer[total_len - 1] = '\0';
+                }
+
                 // Use non-blocking send to avoid blocking in interrupt context
                 if (xQueueSend(g_log_queue, &log_msg, 0) != pdTRUE) {
                     // Queue full, free memory to avoid leak
@@ -259,6 +269,300 @@ static esp_err_t ota_upload_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Web index handler
+static esp_err_t web_index_handler(httpd_req_t *req) {
+    const char* html_page = 
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
+        "<title>Open Grid Monitor</title>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<style>"
+        "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }"
+        ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+        "h1 { color: #333; text-align: center; margin-bottom: 30px; }"
+        ".section { margin-bottom: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 5px; }"
+        ".section h2 { color: #666; margin-top: 0; }"
+        ".form-group { margin-bottom: 15px; }"
+        "label { display: block; margin-bottom: 5px; font-weight: bold; }"
+        "input[type='text'], input[type='password'] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }"
+        "button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }"
+        "button:hover { background-color: #0056b3; }"
+        ".btn-danger { background-color: #dc3545; }"
+        ".btn-danger:hover { background-color: #c82333; }"
+        ".status { padding: 10px; margin: 10px 0; border-radius: 4px; }"
+        ".status-connected { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }"
+        ".status-disconnected { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }"
+        ".measurement { background-color: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 4px; border-left: 4px solid #007bff; }"
+        "</style>"
+        "<script>"
+        "function updateStatus() {"
+        "  fetch('/api/status')"
+        "    .then(response => response.json())"
+        "    .then(data => {"
+        "      document.getElementById('wifi-status').textContent = data.wifi_status || 'Unknown';"
+        "      document.getElementById('mqtt-status').textContent = data.mqtt_connected ? 'Connected' : 'Disconnected';"
+        "      document.getElementById('ip-address').textContent = data.ip_address || 'Unknown';"
+        "      document.getElementById('uptime').textContent = Math.floor(data.uptime_ms / 1000) + ' seconds';"
+        "      document.getElementById('free-heap').textContent = (data.free_heap / 1024).toFixed(1) + ' KB';"
+        "      if (data.last_measurement) {"
+        "        document.getElementById('voltage').textContent = data.last_measurement.voltage.toFixed(1) + ' V';"
+        "        document.getElementById('frequency').textContent = data.last_measurement.frequency.toFixed(3) + ' Hz';"
+        "      }"
+        "    })"
+        "    .catch(error => console.error('Error:', error));"
+        "}"
+        "function saveConfig() {"
+        "  const config = {"
+        "    mqtt_broker: document.getElementById('mqtt-broker').value,"
+        "    mqtt_port: parseInt(document.getElementById('mqtt-port').value),"
+        "    mqtt_username: document.getElementById('mqtt-username').value,"
+        "    mqtt_password: document.getElementById('mqtt-password').value"
+        "  };"
+        "  fetch('/api/config', {"
+        "    method: 'POST',"
+        "    headers: { 'Content-Type': 'application/json' },"
+        "    body: JSON.stringify(config)"
+        "  })"
+        "  .then(response => response.json())"
+        "  .then(data => {"
+        "    alert(data.message || 'Configuration saved successfully!');"
+        "  })"
+        "  .catch(error => {"
+        "    console.error('Error:', error);"
+        "    alert('Error saving configuration');"
+        "  });"
+        "}"
+        "function restartDevice() {"
+        "  if (confirm('Are you sure you want to restart the device?')) {"
+        "    fetch('/api/restart', { method: 'POST' })"
+        "    .then(response => response.json())"
+        "    .then(data => {"
+        "      alert(data.message || 'Device restart initiated');"
+        "    })"
+        "    .catch(error => {"
+        "      console.error('Error:', error);"
+        "      alert('Error initiating restart');"
+        "    });"
+        "  }"
+        "}"
+        "setInterval(updateStatus, 1000);"
+        "window.onload = updateStatus;"
+        "</script>"
+        "</head>"
+        "<body>"
+        "<div class='container'>"
+        "<h1>Open Grid Monitor</h1>"
+
+        // --- Measurements section moved to the top ---
+        "<div class='section'>"
+        "<h2>Current Measurements</h2>"
+        "<div class='measurement'>"
+        "<p><strong>Voltage:</strong> <span id='voltage'>Loading...</span></p>"
+        "<p><strong>Frequency:</strong> <span id='frequency'>Loading...</span></p>"
+        "</div>"
+        "</div>"
+
+        "<div class='section'>"
+        "<h2>System Status</h2>"
+        "<p><strong>WiFi Status:</strong> <span id='wifi-status'>Loading...</span></p>"
+        "<p><strong>MQTT Status:</strong> <span id='mqtt-status'>Loading...</span></p>"
+        "<p><strong>IP Address:</strong> <span id='ip-address'>Loading...</span></p>"
+        "<p><strong>Uptime:</strong> <span id='uptime'>Loading...</span></p>"
+        "<p><strong>Free Heap:</strong> <span id='free-heap'>Loading...</span></p>"
+        "</div>"
+
+        "<div class='section'>"
+        "<h2>MQTT Configuration</h2>"
+        "<div class='form-group'>"
+        "<label for='mqtt-broker'>MQTT Broker URI:</label>"
+        "<input type='text' id='mqtt-broker' placeholder='mqtt://192.168.1.100' value='mqtt://192.168.2.78'>"
+        "</div>"
+        "<div class='form-group'>"
+        "<label for='mqtt-port'>MQTT Port:</label>"
+        "<input type='text' id='mqtt-port' placeholder='1883' value='1883'>"
+        "</div>"
+        "<div class='form-group'>"
+        "<label for='mqtt-username'>MQTT Username:</label>"
+        "<input type='text' id='mqtt-username' placeholder='Username' value='open_grid_monitor'>"
+        "</div>"
+        "<div class='form-group'>"
+        "<label for='mqtt-password'>MQTT Password:</label>"
+        "<input type='password' id='mqtt-password' placeholder='Password'>"
+        "</div>"
+        "<button onclick='saveConfig()'>Save Configuration</button>"
+        "</div>"
+
+        "<div class='section'>"
+        "<h2>Device Control</h2>"
+        "<button class='btn-danger' onclick='restartDevice()'>Restart Device</button>"
+        "</div>"
+
+        "</div>"
+        "</body>"
+        "</html>";
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Web API status handler
+static esp_err_t web_api_status_handler(httpd_req_t *req) {
+    if (!g_network_handle) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Network handle not available");
+        return ESP_FAIL;
+    }
+    
+    // Create status JSON
+    cJSON *json = cJSON_CreateObject();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create JSON");
+        return ESP_FAIL;
+    }
+    
+    // Add basic status info
+    const char *wifi_status_str = "Unknown";
+    switch (g_network_handle->status) {
+        case WIFI_STATUS_DISCONNECTED: wifi_status_str = "Disconnected"; break;
+        case WIFI_STATUS_CONNECTING: wifi_status_str = "Connecting"; break;
+        case WIFI_STATUS_CONNECTED: wifi_status_str = "Connected"; break;
+        case WIFI_STATUS_FAILED: wifi_status_str = "Failed"; break;
+    }
+    
+    cJSON_AddStringToObject(json, "wifi_status", wifi_status_str);
+    cJSON_AddBoolToObject(json, "mqtt_connected", network_is_mqtt_connected());
+    cJSON_AddStringToObject(json, "ip_address", g_network_handle->ip_address);
+    cJSON_AddNumberToObject(json, "uptime_ms", esp_timer_get_time() / 1000);
+    cJSON_AddNumberToObject(json, "free_heap", esp_get_free_heap_size());
+    
+    // Add last measurement if available (placeholder for now)
+    cJSON *measurement = cJSON_CreateObject();
+    float frequency = ade7953_get_latest_frequency(g_network_handle->ade7953_handle);
+    float voltage = ade7953_get_latest_voltage(g_network_handle->ade7953_handle);
+    cJSON_AddNumberToObject(measurement, "voltage", voltage);
+    cJSON_AddNumberToObject(measurement, "frequency", frequency);
+    cJSON_AddItemToObject(json, "last_measurement", measurement);
+    
+    char *json_string = cJSON_Print(json);
+    if (json_string) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_string, HTTPD_RESP_USE_STRLEN);
+        free(json_string);
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to serialize JSON");
+        cJSON_Delete(json);
+        return ESP_FAIL;
+    }
+    
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+// Web API config handler
+static esp_err_t web_api_config_handler(httpd_req_t *req) {
+    if (req->method == HTTP_POST) {
+        // Handle configuration update
+        char content[512];
+        int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+        if (ret <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to receive data");
+            return ESP_FAIL;
+        }
+        content[ret] = '\0';
+        
+        cJSON *json = cJSON_Parse(content);
+        if (!json) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+            return ESP_FAIL;
+        }
+        
+        // Extract configuration values
+        cJSON *mqtt_broker = cJSON_GetObjectItem(json, "mqtt_broker");
+        cJSON *mqtt_port = cJSON_GetObjectItem(json, "mqtt_port");
+        cJSON *mqtt_username = cJSON_GetObjectItem(json, "mqtt_username");
+        cJSON *mqtt_password = cJSON_GetObjectItem(json, "mqtt_password");
+        
+        // TODO: Update the configuration (requires NVS storage implementation)
+        ESP_LOGI(TAG, "Configuration update request received");
+        if (mqtt_broker && cJSON_IsString(mqtt_broker)) {
+            ESP_LOGI(TAG, "MQTT Broker: %s", cJSON_GetStringValue(mqtt_broker));
+        }
+        if (mqtt_port && cJSON_IsNumber(mqtt_port)) {
+            int mqtt_port_value = (int)cJSON_GetNumberValue(mqtt_port);
+            ESP_LOGI(TAG, "MQTT Port: %d", mqtt_port_value);
+        }
+        if (mqtt_username && cJSON_IsString(mqtt_username)) {
+            ESP_LOGI(TAG, "MQTT Username: %s", cJSON_GetStringValue(mqtt_username));
+        }
+        if (mqtt_password && cJSON_IsString(mqtt_password)) {
+            ESP_LOGI(TAG, "MQTT Password: [HIDDEN]");
+        }
+        
+        cJSON_Delete(json);
+        
+        // Send response
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddStringToObject(response, "status", "success");
+        cJSON_AddStringToObject(response, "message", "Configuration received (storage not yet implemented)");
+        
+        char *response_string = cJSON_Print(response);
+        if (response_string) {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, response_string, HTTPD_RESP_USE_STRLEN);
+            free(response_string);
+        }
+        cJSON_Delete(response);
+        
+    } else {
+        // Handle GET request - return current configuration
+        cJSON *config = cJSON_CreateObject();
+        cJSON_AddStringToObject(config, "mqtt_broker", MQTT_BROKER_URI);
+        cJSON_AddNumberToObject(config, "mqtt_port", MQTT_PORT);
+        cJSON_AddStringToObject(config, "mqtt_username", MQTT_USERNAME);
+        cJSON_AddStringToObject(config, "mqtt_password", ""); // Don't send actual password
+        
+        char *config_string = cJSON_Print(config);
+        if (config_string) {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, config_string, HTTPD_RESP_USE_STRLEN);
+            free(config_string);
+        }
+        cJSON_Delete(config);
+    }
+    
+    return ESP_OK;
+}
+
+// Web API restart handler
+static esp_err_t web_api_restart_handler(httpd_req_t *req) {
+    if (req->method == HTTP_POST) {
+        ESP_LOGI(TAG, "Device restart requested via web interface");
+        
+        // Send response first
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddStringToObject(response, "status", "success");
+        cJSON_AddStringToObject(response, "message", "Device restart initiated");
+        
+        char *response_string = cJSON_Print(response);
+        if (response_string) {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, response_string, HTTPD_RESP_USE_STRLEN);
+            free(response_string);
+        }
+        cJSON_Delete(response);
+        
+        // Schedule restart
+        network_schedule_deferred_restart("Web interface restart request");
+        
+        return ESP_OK;
+    } else {
+        httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, "Method not allowed");
+        return ESP_FAIL;
+    }
+}
+
 // MQTT event handler
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -333,7 +637,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     int len = MIN(event->data_len, sizeof(json_command) - 1);
                     strncpy(json_command, event->data, len);
                     json_command[len] = '\0';
-                    ESP_LOGI(TAG, "Received command (type=%d): %s", cmd_type, json_command);
+                    ESP_LOGI(TAG, "Received command (type = %s): %s", cmd_type_to_name(cmd_type), json_command);
                     // Pass both the command type and the message
                     // You may want to update handle_mqtt_command to accept the enum as an argument
                     handle_mqtt_command(json_command, cmd_type);
@@ -417,7 +721,7 @@ static void handle_mqtt_command(const char *json_command, mqtt_command_t cmd_typ
         // Send confirmation back via MQTT if possible
         char status_msg[128];
         snprintf(status_msg, sizeof(status_msg), "{\"id\": %d, \"status\":\"JSON restart command received, performing graceful restart\"}", command_id);
-        safe_publish_mqtt_default(g_network_handle->mqtt_topic_status, status_msg);
+        safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_restart, status_msg);
 
         // Schedule deferred restart to avoid MQTT task deadlock
         esp_err_t defer_err = network_schedule_deferred_restart("MQTT JSON restart command");
@@ -451,7 +755,7 @@ static void handle_mqtt_command(const char *json_command, mqtt_command_t cmd_typ
                     // Send status update
                     char status_msg[256];
                     snprintf(status_msg, sizeof(status_msg), "{\"id\": %d, \"status\":\"Starting OTA update from: %s\"}", command_id, url);
-                    safe_publish_mqtt_default(g_network_handle->mqtt_topic_status, status_msg);
+                    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, status_msg);
                     
                     // Perform OTA update
                     esp_err_t ota_ret = perform_mqtt_ota(url, command_id);
@@ -650,12 +954,17 @@ static void measurement_publishing_task(void *pvParameters) {
 }
 
 // Initialize network
-esp_err_t network_init(network_handle_t *handle) {
-    if (!handle) {
+esp_err_t network_init(network_handle_t *handle, led_handle_t *led_handle, ade7953_handle_t *ade7953_handle) {
+    if (!handle || !led_handle || !ade7953_handle) {
         return ESP_ERR_INVALID_ARG;
     }
     
     memset(handle, 0, sizeof(network_handle_t));
+    
+    // Set the handle pointers
+    handle->led_handle = led_handle;
+    handle->ade7953_handle = ade7953_handle;
+    
     g_network_handle = handle;
     
     // Create log queue
@@ -749,6 +1058,7 @@ esp_err_t network_deinit(network_handle_t *handle) {
     network_stop_log_forwarding(handle);
     network_stop_measurement_publishing(handle);
     network_stop_mqtt_logging(handle);
+    network_stop_web_server(handle);
     network_stop_ota(handle);
     network_stop_wifi(handle);
     
@@ -876,8 +1186,8 @@ esp_err_t network_start_ota(network_handle_t *handle) {
     
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_SERVER_PORT;
-    config.max_uri_handlers = 1;
-    config.stack_size = 8192;
+    config.max_uri_handlers = OTA_MAX_URI;
+    config.stack_size = OTA_STACK_SIZE;
     
     httpd_uri_t ota_uri = {
         .uri = OTA_UPDATE_PATH,
@@ -910,6 +1220,94 @@ esp_err_t network_stop_ota(network_handle_t *handle) {
         g_ota_server = NULL;
         handle->ota_enabled = false;
         ESP_LOGI(TAG, "OTA server stopped");
+    }
+    
+    return ESP_OK;
+}
+
+// Start Web Server
+esp_err_t network_start_web_server(network_handle_t *handle) {
+    if (!handle || handle->status != WIFI_STATUS_CONNECTED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (g_web_server) {
+        ESP_LOGW(TAG, "Web server already started");
+        return ESP_OK;
+    }
+    
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = WEB_SERVER_PORT;
+    config.max_uri_handlers = WEB_SERVER_MAX_URI;
+    config.stack_size = WEB_SERVER_STACK_SIZE;
+    
+    // Define URI handlers
+    httpd_uri_t index_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = web_index_handler,
+        .user_ctx = NULL
+    };
+    
+    httpd_uri_t status_uri = {
+        .uri = "/api/status",
+        .method = HTTP_GET,
+        .handler = web_api_status_handler,
+        .user_ctx = NULL
+    };
+    
+    httpd_uri_t config_get_uri = {
+        .uri = "/api/config",
+        .method = HTTP_GET,
+        .handler = web_api_config_handler,
+        .user_ctx = NULL
+    };
+    
+    httpd_uri_t config_post_uri = {
+        .uri = "/api/config",
+        .method = HTTP_POST,
+        .handler = web_api_config_handler,
+        .user_ctx = NULL
+    };
+    
+    httpd_uri_t restart_uri = {
+        .uri = "/api/restart",
+        .method = HTTP_POST,
+        .handler = web_api_restart_handler,
+        .user_ctx = NULL
+    };
+    
+    // Start the web server
+    if (httpd_start(&g_web_server, &config) == ESP_OK) {
+        // Register URI handlers
+        httpd_register_uri_handler(g_web_server, &index_uri);
+        httpd_register_uri_handler(g_web_server, &status_uri);
+        httpd_register_uri_handler(g_web_server, &config_get_uri);
+        httpd_register_uri_handler(g_web_server, &config_post_uri);
+        httpd_register_uri_handler(g_web_server, &restart_uri);
+        
+        handle->web_server_enabled = true;
+        ESP_LOGI(TAG, "Web server started on port %d", WEB_SERVER_PORT);
+        ESP_LOGI(TAG, "Access web interface at: http://%s:%d/", 
+                 handle->ip_address, WEB_SERVER_PORT);
+        return ESP_OK;
+    }
+    
+    ESP_LOGE(TAG, "Failed to start web server");
+    return ESP_FAIL;
+}
+
+// Stop Web Server
+esp_err_t network_stop_web_server(network_handle_t *handle) {
+    if (!handle) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (g_web_server) {
+        httpd_stop(g_web_server);
+        g_web_server = NULL;
+        handle->web_server_enabled = false;
+        ESP_LOGI(TAG, "Web server stopped");
     }
     
     return ESP_OK;
@@ -1157,6 +1555,8 @@ static void rollback_check_task(void *pvParameters) {
         ESP_LOGE(TAG, "Failed to mark firmware as valid: %s", esp_err_to_name(err));
     } else {
         ESP_LOGI(TAG, "Firmware marked as valid successfully");
+
+        network_publish_firmware_info(g_network_handle);
     }
     
     // Clear the global task handle before exiting
@@ -1375,9 +1775,6 @@ static esp_err_t perform_mqtt_ota(const char *url, int command_id)
         return ESP_FAIL;
     }
 
-    snprintf(status_msg, sizeof(status_msg), "{\"id\":%d,\"status\":\"downloading\",\"url\":\"%s\",\"content_length\":%d}", command_id, url, content_length);
-    safe_publish_mqtt_default(g_network_handle->mqtt_topic_responses_ota, status_msg);
-
     // Get the next update partition
     ota_partition = esp_ota_get_next_update_partition(NULL);
     if (ota_partition == NULL) {
@@ -1468,13 +1865,7 @@ static esp_err_t perform_mqtt_ota(const char *url, int command_id)
                 ESP_LOGI(TAG, "OTA Progress: %d%% (%d chunks received)", progress, chunk_count);
                 
                 // Small delay to allow other tasks to run and MQTT messages to be sent
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            
-            // Yield every 256B to allow other tasks (especially MQTT logging) to run
-            if ((binary_file_length % 256) == 0) {
-                ESP_LOGD(TAG, "OTA: Downloaded %d bytes, yielding to other tasks...", binary_file_length);
-                vTaskDelay(pdMS_TO_TICKS(5));
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
         } else if (data_read == 0) {
             ESP_LOGI(TAG, "OTA download completed - received %d bytes in %d chunks", binary_file_length, chunk_count);
