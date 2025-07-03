@@ -23,6 +23,9 @@ You need an ESP32-S3 connected to an ADE7953 energy metering chip via SPI. The s
 
 The firmware boots up, connects to WiFi, then starts a background task that reads frequency and voltage from the ADE7953 every 20ms. Valid readings (frequency 45-65Hz, voltage 50-300V) get queued and published to MQTT topics. A web server provides real-time access to current readings at the device's IP address. The device also listens for OTA update commands so you can push new firmware remotely.
 
+### About the resolution of the measurements
+According to the [ADE7953 datasheet](documentation/ade7953.pdf), the chip provides a period measurement of the voltage channel (= line voltage) updated once every line cycle. The measurement is based on a 223.75 kHz clock, which translates to a measurement resolution of 0.011 Hz at 50 Hz. To overcome this not-so-ideal resolution for this application, the period measurement is read every 20 ms such that averaging over tens of samples gives us a better measure, while still being very responsive to sudden changes in grid frequency.
+
 ## Setup
 
 1. Install ESP-IDF and set up the environment
