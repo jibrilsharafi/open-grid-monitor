@@ -2,7 +2,7 @@
 
 A complete system for high-resolution electrical grid frequency monitoring and data collection, starting with the Continental European grid.
 
-Check out the real-time dashboard [here](https://opengridmonitor.net/public-dashboards/ad3c54df59d0490daa6cfb120741d50b?refresh=auto)!
+Check out the real-time dashboard [here](https://grafana.opengridmonitor.net/public-dashboards/ad3c54df59d0490daa6cfb120741d50b)!
 
 ![Grafana dashboard](resources/grafana.png)
 
