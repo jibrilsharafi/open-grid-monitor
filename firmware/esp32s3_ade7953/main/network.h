@@ -37,7 +37,7 @@
 #include "secrets.h"
 
 // WiFi configuration
-#define WIFI_MAXIMUM_RETRY      5
+#define WIFI_MAXIMUM_RETRY      5       // Number of WiFi connection retries before rebooting device
 #define WIFI_CONNECTED_BIT      BIT0
 #define WIFI_FAIL_BIT           BIT1
 

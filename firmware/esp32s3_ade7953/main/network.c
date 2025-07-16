@@ -156,11 +156,19 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
             handle->retry_count++;
             handle->status = WIFI_STATUS_CONNECTING;
             ESP_LOGI(TAG, "Retry to connect to WiFi (%d/%d)", handle->retry_count, WIFI_MAXIMUM_RETRY);
-        // Too many retries, give up
+        // Too many retries, reboot device
         } else {
             xEventGroupSetBits(handle->wifi_event_group, WIFI_FAIL_BIT);
             handle->status = WIFI_STATUS_FAILED;
-            ESP_LOGE(TAG, "Failed to connect to WiFi after %d attempts", WIFI_MAXIMUM_RETRY);
+            ESP_LOGE(TAG, "Failed to connect to WiFi after %d attempts - rebooting device in 5 seconds", WIFI_MAXIMUM_RETRY);
+            
+            // Set LED to error status if available
+            if (handle->led_handle) {
+                led_set_status(handle->led_handle, LED_STATUS_ERROR);
+            }
+            
+            // Schedule a delayed reboot to allow log messages to be sent
+            network_schedule_deferred_restart("WiFi connection failed after maximum retries");
         }
     // We got an IP address
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -1225,10 +1233,28 @@ esp_err_t network_start_wifi(network_handle_t *handle) {
         ESP_LOGI(TAG, "Connected to WiFi SSID: %s", WIFI_SSID);
         return ESP_OK;
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "Failed to connect to WiFi SSID: %s", WIFI_SSID);
+        ESP_LOGE(TAG, "Failed to connect to WiFi SSID: %s - rebooting device", WIFI_SSID);
+        
+        // Set LED to error status if available
+        if (handle->led_handle) {
+            led_set_status(handle->led_handle, LED_STATUS_ERROR);
+        }
+        
+        // Schedule a delayed reboot to allow log messages to be sent
+        network_schedule_deferred_restart("Initial WiFi connection failed");
+        
         return ESP_FAIL;
     } else {
-        ESP_LOGE(TAG, "Unexpected WiFi event");
+        ESP_LOGE(TAG, "Unexpected WiFi event - rebooting device");
+        
+        // Set LED to error status if available
+        if (handle->led_handle) {
+            led_set_status(handle->led_handle, LED_STATUS_ERROR);
+        }
+        
+        // Schedule a delayed reboot for unexpected events
+        network_schedule_deferred_restart("Unexpected WiFi event during startup");
+        
         return ESP_FAIL;
     }
 }
